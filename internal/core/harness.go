@@ -7,6 +7,7 @@ import (
 	"fmt"
 	json "github.com/dcalsky/best-harness-go/internal/jsoncodec"
 	"reflect"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -307,29 +308,52 @@ type Session[S any] struct {
 
 type StartOptions struct{ ID ID }
 
+// RunLoop drives the model turns of one logical Run. It must call Run.Next
+// serially and return only when that Run should be finalized.
+type RunLoop[S any] func(context.Context, *Run[S]) (EndReason, error)
+
+type runLoopContextKey struct{}
+
+func cloneToolNames(names []string) []string {
+	if names == nil {
+		return nil
+	}
+	return append([]string{}, names...)
+}
+
 type Run[S any] struct {
-	mu             sync.Mutex
-	session        *Session[S]
-	id             ID
-	ctx            context.Context
-	cancel         context.CancelCauseFunc
-	done           chan struct{}
-	status         Status
-	cause          Cause
-	err            error
-	started        time.Time
-	ended          time.Time
-	current        *AgentRun
-	attempt        int
-	attempts       map[ID]int
-	steering       []Message
-	followup       []Message
-	eventErr       error
-	retried        int
-	overflow       bool
-	pendingFailure *Message
-	finalState     S
-	stateFinal     bool
+	mu              sync.Mutex
+	nextMu          sync.Mutex
+	session         *Session[S]
+	id              ID
+	ctx             context.Context
+	cancel          context.CancelCauseFunc
+	done            chan struct{}
+	status          Status
+	cause           Cause
+	err             error
+	started         time.Time
+	ended           time.Time
+	current         *AgentRun
+	attempt         int
+	attempts        map[ID]int
+	steering        []Message
+	followup        []Message
+	eventErr        error
+	retried         int
+	overflow        bool
+	pendingFailure  *Message
+	finalState      S
+	stateFinal      bool
+	prompt          agent.Prompt
+	pendingReason   EndReason
+	inputVersion    uint64
+	endInputVersion uint64
+	fatalStepErr    error
+	stats           RunStats
+	endReason       EndReason
+	activeTools     []string
+	loopDone        bool
 }
 
 type stateTransaction[S any] struct {
@@ -834,6 +858,31 @@ func (s *Session[S]) emitEntry(ctx context.Context, runID ID, entryID SessionEnt
 }
 
 func (s *Session[S]) Start(ctx context.Context, p Prompt, opts StartOptions) (*Run[S], error) {
+	return s.startWithLoop(ctx, p, opts, defaultRunLoop[S])
+}
+
+// StartWithLoop starts one logical run and lets loop decide when it finishes.
+// The returned Run is the same value passed to loop.
+func (s *Session[S]) StartWithLoop(ctx context.Context, p Prompt, opts StartOptions, loop RunLoop[S]) (*Run[S], error) {
+	if loop == nil {
+		loop = defaultRunLoop[S]
+	}
+	return s.startWithLoop(ctx, p, opts, loop)
+}
+
+func defaultRunLoop[S any](ctx context.Context, r *Run[S]) (EndReason, error) {
+	for {
+		reason, err := r.Next(ctx)
+		if err != nil {
+			return EndReasonNone, err
+		}
+		if reason != EndReasonNone {
+			return reason, nil
+		}
+	}
+}
+
+func (s *Session[S]) startWithLoop(ctx context.Context, p Prompt, opts StartOptions, loop RunLoop[S]) (*Run[S], error) {
 	if len(p.Steps) == 0 {
 		return nil, errors.New("prompt has no steps")
 	}
@@ -851,7 +900,7 @@ func (s *Session[S]) Start(ctx context.Context, p Prompt, opts StartOptions) (*R
 		return nil, err
 	}
 	runCtx, cancel := context.WithCancelCause(ctx)
-	r := &Run[S]{session: s, id: id, ctx: runCtx, cancel: cancel, done: make(chan struct{}), status: StatusRunning, started: time.Now(), attempts: make(map[ID]int)}
+	r := &Run[S]{session: s, id: id, ctx: runCtx, cancel: cancel, done: make(chan struct{}), status: StatusRunning, started: time.Now(), attempts: make(map[ID]int), activeTools: cloneToolNames(s.activeTools)}
 	s.mu.Lock()
 	if s.closed || s.closing {
 		s.mu.Unlock()
@@ -917,14 +966,14 @@ func (s *Session[S]) Start(ctx context.Context, p Prompt, opts StartOptions) (*R
 		return cleanup(err)
 	}
 	s.emitEntry(context.Background(), id, entryID)
-	s.agent.ReplaceMessages(s.store.Context().Messages)
-	s.emit(context.Background(), RunEvent{RunID: id, Status: StatusRunning})
-	attempt, err := s.startAttempt(r, agent.Prompt{Steps: steps})
-	if err != nil {
-		s.finalizeRun(r, err)
+	if err := agent.ValidatePrompt(s.agent, agent.Prompt{Steps: steps}); err != nil {
+		s.finalizeRun(r, EndReasonNone, err)
 		return nil, err
 	}
-	go s.coordinate(r, attempt)
+	s.agent.ReplaceMessages(s.store.Context().Messages)
+	s.emit(context.Background(), RunEvent{RunID: id, Status: StatusRunning})
+	r.prompt = agent.Prompt{Steps: steps}
+	go s.coordinateLoop(r, loop)
 	return r, nil
 }
 
@@ -933,10 +982,13 @@ func (s *Session[S]) startAttempt(r *Run[S], p agent.Prompt) (*AgentRun, error) 
 	r.mu.Lock()
 	r.attempt++
 	n := r.attempt
+	r.stats.Attempts++
 	r.attempts[attemptID] = n
+	tools := cloneToolNames(r.activeTools)
 	r.mu.Unlock()
 	s.agent.ReplaceMessages(s.store.Context().Messages)
-	ar, err := s.agent.Start(r.ctx, p, agent.StartOptions{ID: attemptID})
+	agent.SetActiveTools(s.agent, tools)
+	ar, err := agent.StartStepped(s.agent, r.ctx, p, agent.StartOptions{ID: attemptID})
 	if err != nil {
 		return nil, err
 	}
@@ -969,9 +1021,77 @@ func (s *Session[S]) startAttempt(r *Run[S], p agent.Prompt) (*AgentRun, error) 
 	return ar, nil
 }
 
-func (s *Session[S]) coordinate(r *Run[S], attempt *AgentRun) {
-	err := attempt.Wait(context.Background())
+func (s *Session[S]) coordinateLoop(r *Run[S], loop RunLoop[S]) {
+	loopCtx := context.WithValue(r.ctx, runLoopContextKey{}, r)
+	reason, err := func() (reason EndReason, err error) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				err = &sharedrun.PanicError{Value: recovered, Stack: debug.Stack()}
+			}
+		}()
+		return loop(loopCtx, r)
+	}()
+	if err == nil && reason == EndReasonNone {
+		reason = EndReasonLoopStopped
+	}
+	r.mu.Lock()
+	r.loopDone = true
+	current := r.current
+	r.mu.Unlock()
+	if current != nil {
+		if completeErr := agent.Complete(current); err == nil && completeErr != nil {
+			err = completeErr
+		}
+	}
+	if err == nil && compact.ShouldCompact(s.store.Context().Messages, s.opts.Compaction) && s.opts.Summarizer != nil {
+		_, err = s.compactForRun(r.ctx, CompactOptions{Reason: compact.Threshold}, r.id)
+	}
+	s.finalizeRun(r, reason, err)
+}
+
+func (s *Session[S]) next(ctx context.Context, r *Run[S]) (EndReason, error) {
 	for {
+		if err := ctx.Err(); err != nil {
+			return EndReasonNone, err
+		}
+		r.mu.Lock()
+		attempt := r.current
+		prompt := r.prompt
+		if attempt == nil {
+			r.prompt = agent.Prompt{}
+		}
+		r.mu.Unlock()
+		if attempt == nil {
+			var err error
+			attempt, err = s.startAttempt(r, prompt)
+			if err != nil {
+				r.mu.Lock()
+				r.fatalStepErr = err
+				r.mu.Unlock()
+				return EndReasonNone, err
+			}
+		}
+		r.mu.Lock()
+		inputAtStepStart := r.inputVersion
+		r.mu.Unlock()
+		result, err := agent.Next(attempt, ctx)
+		if result.ModelTurn || result.ToolCalls > 0 {
+			r.mu.Lock()
+			if result.ModelTurn {
+				r.stats.TurnsCompleted++
+			}
+			r.stats.ToolCalls += result.ToolCalls
+			r.mu.Unlock()
+		}
+		if err == nil {
+			r.mu.Lock()
+			r.pendingReason = result.Reason
+			r.endInputVersion = inputAtStepStart
+			r.retried = 0
+			r.mu.Unlock()
+			return result.Reason, nil
+		}
+		_ = attempt.Wait(context.Background())
 		r.mu.Lock()
 		if r.current == attempt {
 			r.current = nil
@@ -982,13 +1102,15 @@ func (s *Session[S]) coordinate(r *Run[S], attempt *AgentRun) {
 		}
 		r.mu.Unlock()
 		if cause := context.Cause(r.ctx); cause != nil {
-			err = cause
-			break
+			r.mu.Lock()
+			r.fatalStepErr = cause
+			r.mu.Unlock()
+			return EndReasonNone, cause
 		}
 		var providerErr *message.ProviderError
 		if errors.As(err, &providerErr) && providerErr.Retryable && r.retried < s.harness.settings.Get(RetryAttempts) {
-			r.retried++
 			r.mu.Lock()
+			r.retried++
 			r.pendingFailure = nil
 			r.mu.Unlock()
 			timer := time.NewTimer(s.harness.settings.Get(RetryDelay))
@@ -996,41 +1118,40 @@ func (s *Session[S]) coordinate(r *Run[S], attempt *AgentRun) {
 			case <-timer.C:
 			case <-r.ctx.Done():
 				timer.Stop()
-				err = context.Cause(r.ctx)
-				break
+				cause := context.Cause(r.ctx)
+				r.mu.Lock()
+				r.fatalStepErr = cause
+				r.mu.Unlock()
+				return EndReasonNone, cause
 			}
-			if context.Cause(r.ctx) != nil {
-				break
-			}
-			attempt, err = s.startAttempt(r, agent.Prompt{})
-			if err != nil {
-				break
-			}
-			err = attempt.Wait(context.Background())
 			continue
 		}
 		if errors.Is(err, message.ErrContextOverflow) && !r.overflow {
-			r.overflow = true
 			r.mu.Lock()
+			r.overflow = true
 			r.pendingFailure = nil
 			r.mu.Unlock()
 			if _, compactErr := s.compactForRun(r.ctx, OverflowOptions(), r.id); compactErr != nil {
 				err = errors.Join(err, compactErr)
-				break
+				r.mu.Lock()
+				r.fatalStepErr = err
+				r.mu.Unlock()
+				return EndReasonNone, err
 			}
-			attempt, err = s.startAttempt(r, agent.Prompt{})
-			if err != nil {
-				break
-			}
-			err = attempt.Wait(context.Background())
 			continue
 		}
-		break
+		var panicErr *sharedrun.PanicError
+		if errors.As(err, &panicErr) {
+			r.mu.Lock()
+			r.pendingFailure = nil
+			r.mu.Unlock()
+			return EndReasonNone, panicErr
+		}
+		r.mu.Lock()
+		r.fatalStepErr = err
+		r.mu.Unlock()
+		return EndReasonNone, err
 	}
-	if err == nil && compact.ShouldCompact(s.store.Context().Messages, s.opts.Compaction) && s.opts.Summarizer != nil {
-		_, err = s.compactForRun(r.ctx, CompactOptions{Reason: compact.Threshold}, r.id)
-	}
-	s.finalizeRun(r, err)
 }
 
 func (s *Session[S]) ActiveRun() *Run[S]          { s.mu.Lock(); defer s.mu.Unlock(); return s.active }
@@ -1055,6 +1176,80 @@ func (r *Run[S]) Wait(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// Next executes and persists one model turn and its tool calls. A non-empty
+// reason is a candidate end; the run remains active until its RunLoop returns.
+func (r *Run[S]) Next(ctx context.Context) (EndReason, error) {
+	if ctx.Value(runLoopContextKey{}) != r {
+		return EndReasonNone, ErrNextUnavailable
+	}
+	if !r.nextMu.TryLock() {
+		return EndReasonNone, agent.ErrBusy
+	}
+	defer r.nextMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		r.fail(err)
+		return EndReasonNone, err
+	}
+	r.mu.Lock()
+	if r.status != StatusRunning || r.loopDone {
+		r.mu.Unlock()
+		return EndReasonNone, sharedrun.ErrFinished
+	}
+	if r.fatalStepErr != nil {
+		err := r.fatalStepErr
+		r.mu.Unlock()
+		return EndReasonNone, errors.Join(sharedrun.ErrFinished, err)
+	}
+	if r.pendingReason != EndReasonNone && r.inputVersion == r.endInputVersion {
+		r.mu.Unlock()
+		return EndReasonNone, ErrNoPendingInput
+	}
+	r.pendingReason = EndReasonNone
+	r.mu.Unlock()
+	reason, err := r.session.next(ctx, r)
+	if err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		r.fail(err)
+	}
+	return reason, err
+}
+
+// SetActiveTools replaces the tools available to subsequent turns of this Run.
+// An empty slice disables tools. Session defaults are restored when the Run ends.
+func (r *Run[S]) SetActiveTools(names []string) error {
+	r.mu.Lock()
+	if r.status != StatusRunning || r.loopDone {
+		r.mu.Unlock()
+		return sharedrun.ErrFinished
+	}
+	r.mu.Unlock()
+	valid := make([]string, 0, len(names))
+	for _, name := range names {
+		if r.session.harness.extensions.Tools.Has(name) {
+			valid = append(valid, name)
+		}
+	}
+	r.mu.Lock()
+	r.activeTools = valid
+	r.mu.Unlock()
+	agent.SetActiveTools(r.session.agent, valid)
+	return nil
+}
+
+// Stats returns a snapshot of this Run's counters.
+func (r *Run[S]) Stats() RunStats {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.stats
+}
+
+// Outcome returns the current lifecycle state and counters. EndReason is final
+// only after the Run has reached a terminal status.
+func (r *Run[S]) Outcome() RunOutcome {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return RunOutcome{Status: r.status, Cause: r.cause, EndReason: r.endReason, Stats: r.stats}
 }
 func (r *Run[S]) State() S {
 	r.mu.Lock()
@@ -1096,26 +1291,32 @@ func (r *Run[S]) Steer(ctx context.Context, m Message) error {
 		return err
 	}
 	r.mu.Lock()
-	if r.status != StatusRunning {
+	if r.status != StatusRunning || r.loopDone {
 		r.mu.Unlock()
 		return sharedrun.ErrFinished
 	}
 	current := r.current
 	if current == nil {
 		r.steering = append(r.steering, m)
+		r.inputVersion++
 		r.mu.Unlock()
 	} else {
 		r.mu.Unlock()
 		if err := current.Steer(m); err != nil {
 			r.mu.Lock()
-			if r.status == StatusRunning {
+			if r.status == StatusRunning && !r.loopDone {
 				r.steering = append(r.steering, m)
+				r.inputVersion++
 				err = nil
 			}
 			r.mu.Unlock()
 			if err != nil {
 				return err
 			}
+		} else {
+			r.mu.Lock()
+			r.inputVersion++
+			r.mu.Unlock()
 		}
 	}
 	r.session.emit(ctx, QueueEvent{})
@@ -1126,26 +1327,32 @@ func (r *Run[S]) FollowUp(ctx context.Context, m Message) error {
 		return err
 	}
 	r.mu.Lock()
-	if r.status != StatusRunning {
+	if r.status != StatusRunning || r.loopDone {
 		r.mu.Unlock()
 		return sharedrun.ErrFinished
 	}
 	current := r.current
 	if current == nil {
 		r.followup = append(r.followup, m)
+		r.inputVersion++
 		r.mu.Unlock()
 	} else {
 		r.mu.Unlock()
 		if err := current.FollowUp(m); err != nil {
 			r.mu.Lock()
-			if r.status == StatusRunning {
+			if r.status == StatusRunning && !r.loopDone {
 				r.followup = append(r.followup, m)
+				r.inputVersion++
 				err = nil
 			}
 			r.mu.Unlock()
 			if err != nil {
 				return err
 			}
+		} else {
+			r.mu.Lock()
+			r.inputVersion++
+			r.mu.Unlock()
 		}
 	}
 	r.session.emit(ctx, QueueEvent{})
@@ -1169,7 +1376,7 @@ func (r *Run[S]) fail(err error) {
 	}
 }
 
-func (s *Session[S]) finalizeRun(r *Run[S], err error) {
+func (s *Session[S]) finalizeRun(r *Run[S], reason EndReason, err error) {
 	r.mu.Lock()
 	pendingFailure := r.pendingFailure
 	r.pendingFailure = nil
@@ -1183,10 +1390,18 @@ func (s *Session[S]) finalizeRun(r *Run[S], err error) {
 		}
 	}
 	status, cause, finalErr := classifyRun(r.ctx, err)
-	entryID, persistErr := s.store.AppendRunEnd(r.id, status, cause, finalErr)
+	if finalErr != nil {
+		reason = EndReasonNone
+	}
+	r.mu.Lock()
+	stats := r.stats
+	r.mu.Unlock()
+	outcome := RunOutcome{Status: status, Cause: cause, EndReason: reason, Stats: stats}
+	entryID, persistErr := s.store.AppendRunOutcome(r.id, outcome, finalErr)
 	if persistErr != nil {
 		status = StatusFailed
 		cause = CauseInternal
+		reason = EndReasonNone
 		finalErr = errors.Join(finalErr, persistErr)
 	} else {
 		s.emitEntry(context.Background(), r.id, entryID)
@@ -1201,6 +1416,7 @@ func (s *Session[S]) finalizeRun(r *Run[S], err error) {
 	r.status = status
 	r.cause = cause
 	r.err = finalErr
+	r.endReason = reason
 	r.ended = time.Now()
 	r.current = nil
 	r.steering = nil
@@ -1208,8 +1424,9 @@ func (s *Session[S]) finalizeRun(r *Run[S], err error) {
 	r.finalState = finalState
 	r.stateFinal = true
 	r.mu.Unlock()
-	s.emit(context.Background(), RunEvent{RunID: r.id, Status: status, Cause: cause, Err: finalErr})
+	s.emit(context.Background(), RunEvent{RunID: r.id, Status: status, Cause: cause, EndReason: reason, Stats: stats, Err: finalErr})
 	s.mu.Lock()
+	agent.SetActiveTools(s.agent, s.activeTools)
 	if s.active == r {
 		s.active = nil
 	}

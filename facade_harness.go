@@ -19,6 +19,7 @@ type (
 	Session[S any]            = core.Session[S]
 	StartOptions              = core.StartOptions
 	Run[S any]                = core.Run[S]
+	RunLoop[S any]            = core.RunLoop[S]
 	Prompt                    = core.Prompt
 	Unsubscribe               = core.Unsubscribe
 	Event                     = core.Event

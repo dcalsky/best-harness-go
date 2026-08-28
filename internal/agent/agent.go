@@ -7,6 +7,7 @@ import (
 	"fmt"
 	json "github.com/dcalsky/best-harness-go/internal/jsoncodec"
 	"io"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -196,6 +197,22 @@ type Agent struct {
 
 type StartOptions struct{ ID sharedrun.ID }
 
+type StepResult struct {
+	Reason    sharedrun.EndReason
+	ModelTurn bool
+	ToolCalls int
+}
+
+type stepCommand struct {
+	result chan stepResponse
+	finish bool
+}
+
+type stepResponse struct {
+	result StepResult
+	err    error
+}
+
 type Run struct {
 	mu                 sync.Mutex
 	agent              *Agent
@@ -209,6 +226,8 @@ type Run struct {
 	runStart           int
 	steering, followup []message.Message
 	validatorFailures  map[validatorFailureKey]int
+	commands           chan stepCommand
+	stepMu             sync.Mutex
 }
 
 type validatorFailureKey struct {
@@ -263,6 +282,14 @@ func (a *Agent) ReplaceMessages(ms []message.Message) {
 	a.messages = append([]message.Message(nil), ms...)
 }
 func (a *Agent) Start(ctx context.Context, p Prompt, opts StartOptions) (*Run, error) {
+	return a.start(ctx, p, opts, false)
+}
+
+func StartStepped(a *Agent, ctx context.Context, p Prompt, opts StartOptions) (*Run, error) {
+	return a.start(ctx, p, opts, true)
+}
+
+func (a *Agent) start(ctx context.Context, p Prompt, opts StartOptions, stepped bool) (*Run, error) {
 	a.mu.Lock()
 	if a.active != nil {
 		a.mu.Unlock()
@@ -297,10 +324,35 @@ func (a *Agent) Start(ctx context.Context, p Prompt, opts StartOptions) (*Run, e
 		runStart:          len(a.messages),
 		validatorFailures: make(map[validatorFailureKey]int),
 	}
+	if stepped {
+		r.commands = make(chan stepCommand)
+	}
 	a.active = r
 	a.mu.Unlock()
-	go a.run(r, steps)
+	if stepped {
+		go a.runStepped(r, steps)
+	} else {
+		go a.run(r, steps)
+	}
 	return r, nil
+}
+
+func SetActiveTools(a *Agent, names []string) {
+	a.mu.Lock()
+	if names == nil {
+		a.opts.ActiveTools = nil
+	} else {
+		a.opts.ActiveTools = append([]string{}, names...)
+	}
+	a.mu.Unlock()
+}
+
+func ValidatePrompt(a *Agent, p Prompt) error {
+	steps, err := p.Steps.Normalize()
+	if err != nil {
+		return err
+	}
+	return a.validateScriptTools(steps)
 }
 
 func (a *Agent) validateScriptTools(steps prompt.Sequence) error {
@@ -381,6 +433,50 @@ func (r *Run) FollowUp(m message.Message) error {
 	r.mu.Unlock()
 	r.agent.emit(Event{Type: EventQueueUpdate, RunID: r.id})
 	return nil
+}
+
+func Next(r *Run, ctx context.Context) (StepResult, error) {
+	if r.commands == nil {
+		return StepResult{}, errors.New("agent run is not stepped")
+	}
+	if !r.stepMu.TryLock() {
+		return StepResult{}, ErrBusy
+	}
+	defer r.stepMu.Unlock()
+	response := make(chan stepResponse, 1)
+	select {
+	case r.commands <- stepCommand{result: response}:
+	case <-r.done:
+		return StepResult{}, sharedrun.ErrFinished
+	case <-ctx.Done():
+		return StepResult{}, ctx.Err()
+	}
+	select {
+	case got := <-response:
+		return got.result, got.err
+	case <-r.done:
+		select {
+		case got := <-response:
+			return got.result, got.err
+		default:
+		}
+		return StepResult{}, r.Err()
+	case <-ctx.Done():
+		r.cancel(ctx.Err())
+		return StepResult{}, ctx.Err()
+	}
+}
+
+func Complete(r *Run) error {
+	if r.commands == nil {
+		return errors.New("agent run is not stepped")
+	}
+	select {
+	case r.commands <- stepCommand{finish: true}:
+	case <-r.done:
+		return r.Err()
+	}
+	return r.Wait(context.Background())
 }
 
 func (r *Run) observeValidatorResult(toolName string, validationErr error) (error, error) {
@@ -475,7 +571,7 @@ func classify(ctx context.Context, err error) (sharedrun.Status, sharedrun.Cause
 func (a *Agent) run(r *Run, steps prompt.Sequence) {
 	ctx := r.ctx
 	a.emit(Event{Type: EventAgentStart})
-	enterAgentLoop, err := a.executePromptSteps(r, ctx, steps)
+	enterAgentLoop, _, _, err := a.executePromptSteps(r, ctx, steps)
 	if err != nil {
 		a.finish(r, err)
 		return
@@ -488,82 +584,165 @@ func (a *Agent) run(r *Run, steps prompt.Sequence) {
 	// provider request, not after the first assistant response.
 	a.drain(r, true)
 	for {
-		if err := ctx.Err(); err != nil {
-			a.finish(r, err)
-			return
-		}
-		a.emit(Event{Type: EventTurnStart})
-		assistant, calls, err := a.modelTurn(ctx)
-		if err != nil {
-			a.appendFailureMessage(assistant, ctx, err)
-			a.finish(r, err)
-			return
-		}
-		if err := ctx.Err(); err != nil {
-			a.appendFailureMessage(assistant, ctx, err)
-			a.finish(r, err)
-			return
-		}
-		if assistant.StopReason == message.StopError && assistant.ErrorMessage == "" {
-			assistant.ErrorMessage = "provider returned an error stop reason"
-		}
-		if assistant.StopReason == message.StopAborted && assistant.ErrorMessage == "" {
-			assistant.ErrorMessage = "provider aborted run"
-		}
-		a.appendMessage(assistant)
-		if assistant.StopReason == message.StopError || assistant.StopReason == message.StopAborted {
-			a.emit(Event{Type: EventTurnEnd, Message: &assistant})
-			err := errors.New("provider returned an error stop reason")
-			if assistant.StopReason == message.StopAborted {
-				err = ErrProviderAborted
-			}
-			a.finish(r, err)
-			return
-		}
-		terminate := false
-		if len(calls) > 0 {
-			var results []message.Message
-			if assistant.StopReason == message.StopLength {
-				results = a.failTruncatedCalls(calls)
-			} else {
-				results, terminate, _, err = a.executeCalls(r, ctx, calls)
-			}
-			for _, m := range results {
-				a.appendMessage(m)
-			}
-			if err != nil {
-				a.finish(r, err)
-				return
-			}
-		}
-		a.emit(Event{Type: EventTurnEnd, Message: &assistant})
-		preparedMore, stop, err := a.afterTurn(ctx)
+		result, err := a.executeModelStep(r, ctx)
 		if err != nil {
 			a.finish(r, err)
 			return
 		}
-		if stop {
+		if result.Reason != sharedrun.EndReasonNone {
 			a.finish(r, nil)
 			return
 		}
-		if a.drain(r, true) {
-			continue
-		}
-		if preparedMore || (len(calls) > 0 && !terminate) {
-			continue
-		}
-		if a.drain(r, false) {
-			continue
-		}
-		a.finish(r, nil)
-		return
 	}
 }
 
-func (a *Agent) executePromptSteps(r *Run, ctx context.Context, steps prompt.Sequence) (bool, error) {
+func (a *Agent) runStepped(r *Run, steps prompt.Sequence) {
+	ctx := r.ctx
+	a.emit(Event{Type: EventAgentStart})
+	first := true
+	previousReason := sharedrun.EndReasonNone
+	for {
+		select {
+		case <-ctx.Done():
+			a.finish(r, context.Cause(ctx))
+			return
+		case command := <-r.commands:
+			if command.finish {
+				a.finish(r, nil)
+				return
+			}
+			result := StepResult{}
+			var err error
+			if first {
+				first = false
+				var enter bool
+				var promptReason sharedrun.EndReason
+				var promptTools int
+				enter, promptReason, promptTools, err = a.executePromptSteps(r, ctx, steps)
+				result.ToolCalls += promptTools
+				if err == nil && !enter {
+					result.Reason = promptReason
+				}
+				if err != nil || !enter {
+					previousReason = result.Reason
+					command.result <- stepResponse{result: result, err: err}
+					if err != nil {
+						a.finish(r, err)
+						return
+					}
+					continue
+				}
+				a.drain(r, true)
+			} else if previousReason != sharedrun.EndReasonNone {
+				if !a.drain(r, true) {
+					a.drain(r, false)
+				}
+			}
+			step, stepErr := a.executeModelStep(r, ctx)
+			result.Reason = step.Reason
+			result.ModelTurn = step.ModelTurn
+			result.ToolCalls += step.ToolCalls
+			previousReason = result.Reason
+			command.result <- stepResponse{result: result, err: stepErr}
+			if stepErr != nil {
+				a.finish(r, stepErr)
+				return
+			}
+		}
+	}
+}
+
+func (a *Agent) executeModelStep(r *Run, ctx context.Context) (result StepResult, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = &sharedrun.PanicError{Value: recovered, Stack: debug.Stack()}
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	a.emit(Event{Type: EventTurnStart})
+	assistant, calls, err := a.safeModelTurn(ctx)
+	if err != nil {
+		a.appendFailureMessage(assistant, ctx, err)
+		return result, err
+	}
+	result.ModelTurn = true
+	result.ToolCalls = len(calls)
+	if err := ctx.Err(); err != nil {
+		a.appendFailureMessage(assistant, ctx, err)
+		return result, err
+	}
+	if assistant.StopReason == message.StopError && assistant.ErrorMessage == "" {
+		assistant.ErrorMessage = "provider returned an error stop reason"
+	}
+	if assistant.StopReason == message.StopAborted && assistant.ErrorMessage == "" {
+		assistant.ErrorMessage = "provider aborted run"
+	}
+	a.appendMessage(assistant)
+	if assistant.StopReason == message.StopError || assistant.StopReason == message.StopAborted {
+		a.emit(Event{Type: EventTurnEnd, Message: &assistant})
+		err := errors.New("provider returned an error stop reason")
+		if assistant.StopReason == message.StopAborted {
+			err = ErrProviderAborted
+		}
+		return result, err
+	}
+	terminate := false
+	if len(calls) > 0 {
+		var results []message.Message
+		if assistant.StopReason == message.StopLength {
+			results = a.failTruncatedCalls(calls)
+		} else {
+			results, terminate, _, err = a.executeCalls(r, ctx, calls)
+		}
+		for _, m := range results {
+			a.appendMessage(m)
+		}
+		if err != nil {
+			return result, err
+		}
+	}
+	a.emit(Event{Type: EventTurnEnd, Message: &assistant})
+	preparedMore, stop, err := a.afterTurn(ctx)
+	if err != nil {
+		return result, err
+	}
+	if stop {
+		result.Reason = sharedrun.EndReasonLoopStopped
+		return result, nil
+	}
+	if a.drain(r, true) {
+		return result, nil
+	}
+	if preparedMore || (len(calls) > 0 && !terminate) {
+		return result, nil
+	}
+	if a.drain(r, false) {
+		return result, nil
+	}
+	if terminate {
+		result.Reason = sharedrun.EndReasonToolTerminate
+	} else {
+		result.Reason = sharedrun.EndReasonAssistantStop
+	}
+	return result, nil
+}
+
+func (a *Agent) safeModelTurn(ctx context.Context) (assistant message.Message, calls []tool.ToolCall, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = &sharedrun.PanicError{Value: recovered, Stack: debug.Stack()}
+		}
+	}()
+	return a.modelTurn(ctx)
+}
+
+func (a *Agent) executePromptSteps(r *Run, ctx context.Context, steps prompt.Sequence) (bool, sharedrun.EndReason, int, error) {
+	toolCalls := 0
 	for _, raw := range steps {
 		if err := ctx.Err(); err != nil {
-			return false, err
+			return false, sharedrun.EndReasonNone, toolCalls, err
 		}
 		switch step := raw.(type) {
 		case prompt.UserMessageStep:
@@ -576,15 +755,16 @@ func (a *Agent) executePromptSteps(r *Run, ctx context.Context, steps prompt.Seq
 			a.emit(Event{Type: EventMessageStart, Message: &m})
 			a.appendMessage(m)
 			if err := ctx.Err(); err != nil {
-				return false, err
+				return false, sharedrun.EndReasonNone, toolCalls, err
 			}
 			a.emit(Event{Type: EventTurnEnd, Message: &m})
 			_, stop, err := a.afterTurn(ctx)
 			if err != nil || stop {
-				return false, err
+				return false, sharedrun.EndReasonPromptDone, toolCalls, err
 			}
 		case prompt.ToolCallsStep:
 			for _, planned := range step.Calls {
+				toolCalls++
 				call := tool.ToolCall{ID: "call_" + xid.New().String(), Key: planned.Key, Name: planned.Name, Arguments: planned.Arguments.Clone()}
 				content := message.ToolCall(call.ID, call.Name, call.Arguments)
 				content.Key = call.Key
@@ -593,14 +773,14 @@ func (a *Agent) executePromptSteps(r *Run, ctx context.Context, steps prompt.Seq
 				a.emit(Event{Type: EventMessageStart, Message: &assistant})
 				a.appendMessage(assistant)
 				if err := ctx.Err(); err != nil {
-					return false, err
+					return false, sharedrun.EndReasonNone, toolCalls, err
 				}
 				results, terminate, callErrors, err := a.executeCalls(r, ctx, []tool.ToolCall{call})
 				for _, result := range results {
 					a.appendMessage(result)
 				}
 				if err != nil {
-					return false, err
+					return false, sharedrun.EndReasonNone, toolCalls, err
 				}
 				a.emit(Event{Type: EventTurnEnd, Message: &assistant})
 				failed := len(results) > 0 && results[0].IsError
@@ -611,11 +791,15 @@ func (a *Agent) executePromptSteps(r *Run, ctx context.Context, steps prompt.Seq
 					} else if text := results[0].Text(); text != "" {
 						cause = errors.New(text)
 					}
-					return false, &ScriptToolError{Key: planned.Key, Name: planned.Name, Cause: cause}
+					return false, sharedrun.EndReasonNone, toolCalls, &ScriptToolError{Key: planned.Key, Name: planned.Name, Cause: cause}
 				}
 				_, stop, err := a.afterTurn(ctx)
 				if err != nil || stop || terminate {
-					return false, err
+					reason := sharedrun.EndReasonPromptDone
+					if terminate {
+						reason = sharedrun.EndReasonToolTerminate
+					}
+					return false, reason, toolCalls, err
 				}
 				if !failed {
 					continue
@@ -624,12 +808,12 @@ func (a *Agent) executePromptSteps(r *Run, ctx context.Context, steps prompt.Seq
 				case prompt.OnErrorContinue:
 					continue
 				case prompt.OnErrorEnterAgentLoop:
-					return true, nil
+					return true, sharedrun.EndReasonNone, toolCalls, nil
 				}
 			}
 		}
 	}
-	return true, nil
+	return true, sharedrun.EndReasonNone, toolCalls, nil
 }
 
 func (a *Agent) afterTurn(ctx context.Context) (preparedMore, stop bool, err error) {
@@ -718,7 +902,13 @@ type assembledCall struct {
 }
 
 func (a *Agent) modelTurn(ctx context.Context) (message.Message, []tool.ToolCall, error) {
-	req := provider.Request{Model: a.opts.Model, SystemPrompt: a.opts.SystemPrompt, Messages: message.ExpandLargeText(a.Messages()), Tools: a.opts.Tools.Definitions(a.opts.ActiveTools), MaxTokens: a.opts.Model.MaxOutput, ReasoningEffort: a.opts.ReasoningEffort, Generation: a.opts.Generation.Clone()}
+	a.mu.Lock()
+	activeTools := append([]string(nil), a.opts.ActiveTools...)
+	if a.opts.ActiveTools != nil && len(a.opts.ActiveTools) == 0 {
+		activeTools = []string{}
+	}
+	a.mu.Unlock()
+	req := provider.Request{Model: a.opts.Model, SystemPrompt: a.opts.SystemPrompt, Messages: message.ExpandLargeText(a.Messages()), Tools: a.opts.Tools.Definitions(activeTools), MaxTokens: a.opts.Model.MaxOutput, ReasoningEffort: a.opts.ReasoningEffort, Generation: a.opts.Generation.Clone()}
 	stream, err := a.opts.Provider.Stream(ctx, req)
 	if err != nil {
 		return message.Message{}, nil, err
@@ -808,10 +998,30 @@ func normalizeArguments(raw string) json.RawMessage {
 	return json.RawMessage(`{}`)
 }
 
-func (a *Agent) executeCalls(r *Run, ctx context.Context, calls []tool.ToolCall) ([]message.Message, bool, []error, error) {
-	results := make([]message.Message, len(calls))
-	errs := make([]error, len(calls))
+func (a *Agent) executeCalls(r *Run, ctx context.Context, calls []tool.ToolCall) (results []message.Message, terminate bool, errs []error, err error) {
+	results = make([]message.Message, len(calls))
+	errs = make([]error, len(calls))
 	terminated := make([]bool, len(calls))
+	started := make([]bool, len(calls))
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			panicErr := &sharedrun.PanicError{Value: recovered, Stack: debug.Stack()}
+			for i, call := range calls {
+				if results[i].Role != "" {
+					continue
+				}
+				if !started[i] {
+					a.emit(Event{Type: EventToolStart, Call: &call})
+				}
+				res := tool.Result{Content: []message.Content{message.Text(panicErr.Error())}, IsError: true}
+				errs[i] = panicErr
+				results[i] = message.Message{Role: message.RoleTool, Origin: message.OriginTool, Content: res.Content, ToolCallID: call.ID, ToolCallKey: call.Key, ToolName: call.Name, IsError: true, Timestamp: time.Now().UnixMilli()}
+				a.emit(Event{Type: EventToolEnd, Call: &call, Result: &res, Err: panicErr})
+			}
+			terminate = false
+			err = panicErr
+		}
+	}()
 	var wg sync.WaitGroup
 	var parallelBatch invocation.ToolBatch
 	var commitErr error
@@ -845,7 +1055,18 @@ func (a *Agent) executeCalls(r *Run, ctx context.Context, calls []tool.ToolCall)
 		results[i] = message.Message{Role: message.RoleTool, Origin: message.OriginTool, Content: res.Content, ToolCallID: call.ID, ToolCallKey: call.Key, ToolName: call.Name, IsError: true, Timestamp: time.Now().UnixMilli()}
 	}
 	run := func(i int, prepared *tool.Prepared, call tool.ToolCall) {
-		defer wg.Done()
+		finished := false
+		defer func() {
+			if recovered := recover(); recovered != nil && !finished {
+				panicErr := &sharedrun.PanicError{Value: recovered, Stack: debug.Stack()}
+				res := tool.Result{Content: []message.Content{message.Text(panicErr.Error())}, IsError: true}
+				errs[i] = panicErr
+				terminated[i] = false
+				results[i] = message.Message{Role: message.RoleTool, Origin: message.OriginTool, Content: res.Content, ToolCallID: call.ID, ToolCallKey: call.Key, ToolName: call.Name, IsError: true, Timestamp: time.Now().UnixMilli()}
+				a.emit(Event{Type: EventToolEnd, Call: &call, Result: &res, Err: panicErr})
+			}
+			wg.Done()
+		}()
 		execCtx := ctx
 		report := func(v any) error {
 			a.emit(Event{Type: EventToolUpdate, Call: &call, Update: v})
@@ -899,12 +1120,14 @@ func (a *Agent) executeCalls(r *Run, ctx context.Context, calls []tool.ToolCall)
 		}
 		results[i] = message.Message{Role: message.RoleTool, Origin: message.OriginTool, Content: res.Content, ToolCallID: call.ID, ToolCallKey: call.Key, ToolName: call.Name, IsError: res.IsError, Timestamp: time.Now().UnixMilli()}
 		a.emit(Event{Type: EventToolEnd, Call: &call, Result: &res, Err: err})
+		finished = true
 	}
 	preparedCalls := make([]*tool.Prepared, len(calls))
 	preparedValues := make([]tool.ToolCall, len(calls))
 	for i, original := range calls {
 		call := original
 		a.emit(Event{Type: EventToolStart, Call: &call})
+		started[i] = true
 		if err := ctx.Err(); err != nil {
 			recordCanceled(i, call, err)
 			continue
@@ -993,7 +1216,13 @@ func (a *Agent) executeCalls(r *Run, ctx context.Context, calls []tool.ToolCall)
 	if validatorLimitErr != nil {
 		return results, false, errs, validatorLimitErr
 	}
-	terminate := len(terminated) > 0
+	for _, callErr := range errs {
+		var panicErr *sharedrun.PanicError
+		if errors.As(callErr, &panicErr) {
+			return results, false, errs, panicErr
+		}
+	}
+	terminate = len(terminated) > 0
 	for _, stop := range terminated {
 		terminate = terminate && stop
 	}

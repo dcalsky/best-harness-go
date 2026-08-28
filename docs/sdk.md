@@ -215,6 +215,47 @@ lastReply := messages[len(messages)-1].Text()
 
 `Run.Status()` 返回当前状态，`Run.Err()` 返回结束错误，`Run.Abort()` 请求终止运行。
 
+### 自定义单次 Run 的 Agent 循环
+
+需要按轮数或业务状态控制后续模型调用时，使用 `StartWithLoop`。循环仍操作同一个 `Run`，不会为每一轮创建新的逻辑 Run：
+
+```go
+run, err := session.StartWithLoop(ctx, prompt, harness.StartOptions{}, func(
+	ctx context.Context,
+	run *harness.Run[harness.NoState],
+) (harness.EndReason, error) {
+	wrappingUp := false
+	for {
+		reason, err := run.Next(ctx)
+		if err != nil {
+			return "", err
+		}
+		if reason != "" {
+			if wrappingUp {
+				return "max_turns", nil
+			}
+			return reason, nil
+		}
+		if wrappingUp {
+			return "max_turns", nil
+		}
+		if run.Stats().TurnsCompleted >= maxTurns {
+			if err := run.SetActiveTools(nil); err != nil {
+				return "", err
+			}
+			if err := run.FollowUp(ctx, harness.User("Finish without tools.")); err != nil {
+				return "", err
+			}
+			wrappingUp = true
+		}
+	}
+})
+```
+
+`Next` 完成一次模型响应、对应工具调用和消息持久化。空的 `EndReason` 表示默认还需要下一轮；非空值只是候选结束原因，循环追加 `FollowUp` 或 `Steer` 后仍可继续。循环函数返回时 Run 才真正结束。`Next` 只能在传给 `StartWithLoop` 的 context 中调用。
+
+`Start` 使用 SDK 默认循环。没有逐轮控制需求时继续使用 `Start`。
+
 ### 文本和图片
 
 一条输入可以包含多种内容：
@@ -808,7 +849,10 @@ for {
 | `Wait` | 等待运行结束 |
 | `Done` | 获取结束通知 channel |
 | `Status` / `Err` | 读取运行结果 |
+| `Outcome` / `Stats` | 读取结束原因和轮次、attempt、工具调用统计 |
 | `State` | 读取该次运行结束时的状态 |
+| `Next` | 在 `StartWithLoop` 的循环中执行下一轮 |
+| `SetActiveTools` | 修改当前 Run 后续轮次的工具 |
 | `Steer` | 修正当前任务 |
 | `FollowUp` | 排队后续任务 |
 | `Abort` | 请求终止运行 |
