@@ -57,6 +57,8 @@ type Entry struct {
 	RunID            run.ID           `json:"runId,omitempty"`
 	RunStatus        run.Status       `json:"runStatus,omitempty"`
 	RunCause         run.Cause        `json:"runCause,omitempty"`
+	RunEndReason     run.EndReason    `json:"runEndReason,omitempty"`
+	RunStats         *run.Stats       `json:"runStats,omitempty"`
 	RunError         string           `json:"runError,omitempty"`
 	State            json.RawMessage  `json:"state,omitempty"`
 }
@@ -274,6 +276,10 @@ func (m *Manager) AppendRunStart(id run.ID) (EntryID, error) {
 	return m.appendLocked(Entry{Type: "run_start", RunID: id, RunStatus: run.StatusRunning})
 }
 func (m *Manager) AppendRunEnd(id run.ID, status run.Status, cause run.Cause, runErr error) (EntryID, error) {
+	return m.AppendRunOutcome(id, run.Outcome{Status: status, Cause: cause}, runErr)
+}
+func (m *Manager) AppendRunOutcome(id run.ID, outcome run.Outcome, runErr error) (EntryID, error) {
+	status := outcome.Status
 	if !run.Terminal(status) {
 		return "", errors.New("run end requires a terminal status")
 	}
@@ -281,7 +287,8 @@ func (m *Manager) AppendRunEnd(id run.ID, status run.Status, cause run.Cause, ru
 	if runErr != nil {
 		text = runErr.Error()
 	}
-	return m.append(Entry{Type: "run_end", RunID: id, RunStatus: status, RunCause: cause, RunError: text})
+	stats := outcome.Stats
+	return m.append(Entry{Type: "run_end", RunID: id, RunStatus: status, RunCause: outcome.Cause, RunEndReason: outcome.EndReason, RunStats: &stats, RunError: text})
 }
 func (m *Manager) RunInfo(id run.ID) (run.Info, error) {
 	for _, info := range m.RunHistory() {
@@ -313,6 +320,10 @@ func (m *Manager) RunHistory() []run.Info {
 			ended, _ := time.Parse(time.RFC3339Nano, entry.Timestamp)
 			out[i].Status = entry.RunStatus
 			out[i].Cause = entry.RunCause
+			out[i].EndReason = entry.RunEndReason
+			if entry.RunStats != nil {
+				out[i].Stats = *entry.RunStats
+			}
 			out[i].Error = entry.RunError
 			out[i].EndedAt = ended
 		}

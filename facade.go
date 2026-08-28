@@ -46,10 +46,14 @@ type (
 
 // Run lifecycle types describe IDs, terminal states, and persisted metadata.
 type (
-	ID     = sharedrun.ID
-	Status = sharedrun.Status
-	Cause  = sharedrun.Cause
-	Info   = sharedrun.Info
+	ID         = sharedrun.ID
+	Status     = sharedrun.Status
+	Cause      = sharedrun.Cause
+	EndReason  = sharedrun.EndReason
+	RunStats   = sharedrun.Stats
+	RunOutcome = sharedrun.Outcome
+	PanicError = sharedrun.PanicError
+	Info       = sharedrun.Info
 )
 
 // Tool types retain their original identity, including the Go 1.27 generic
@@ -139,6 +143,12 @@ const (
 	CauseInterrupted    = sharedrun.CauseInterrupted
 	CauseInternal       = sharedrun.CauseInternal
 
+	EndReasonNone          = sharedrun.EndReasonNone
+	EndReasonAssistantStop = sharedrun.EndReasonAssistantStop
+	EndReasonPromptDone    = sharedrun.EndReasonPromptDone
+	EndReasonToolTerminate = sharedrun.EndReasonToolTerminate
+	EndReasonLoopStopped   = sharedrun.EndReasonLoopStopped
+
 	Sequential = tool.Sequential
 	Parallel   = tool.Parallel
 )
@@ -150,12 +160,14 @@ var (
 	ErrContextOverflow = message.ErrContextOverflow
 	ErrModelNotFound   = model.ErrModelNotFound
 
-	ErrAborted     = sharedrun.ErrAborted
-	ErrInterrupted = sharedrun.ErrInterrupted
-	ErrFinished    = sharedrun.ErrFinished
-	ErrNotFound    = sharedrun.ErrNotFound
-	ErrDuplicateID = sharedrun.ErrDuplicateID
-	ErrInvalidID   = sharedrun.ErrInvalidID
+	ErrAborted         = sharedrun.ErrAborted
+	ErrInterrupted     = sharedrun.ErrInterrupted
+	ErrFinished        = sharedrun.ErrFinished
+	ErrNotFound        = sharedrun.ErrNotFound
+	ErrDuplicateID     = sharedrun.ErrDuplicateID
+	ErrInvalidID       = sharedrun.ErrInvalidID
+	ErrNoPendingInput  = sharedrun.ErrNoPendingInput
+	ErrNextUnavailable = sharedrun.ErrNextUnavailable
 
 	ErrToolNotFound      = tool.ErrNotFound
 	ErrStaleContext      = invocation.ErrStaleContext

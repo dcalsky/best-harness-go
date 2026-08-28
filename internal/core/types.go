@@ -66,6 +66,10 @@ type (
 	ID                        = sharedrun.ID
 	Status                    = sharedrun.Status
 	Cause                     = sharedrun.Cause
+	EndReason                 = sharedrun.EndReason
+	RunStats                  = sharedrun.Stats
+	RunOutcome                = sharedrun.Outcome
+	PanicError                = sharedrun.PanicError
 	Info                      = sharedrun.Info
 	Persistence               = store.Persistence
 	PersistenceOptions        = store.Options
@@ -97,11 +101,19 @@ const (
 	CauseInterrupted    = sharedrun.CauseInterrupted
 	CauseInternal       = sharedrun.CauseInternal
 
+	EndReasonNone          = sharedrun.EndReasonNone
+	EndReasonAssistantStop = sharedrun.EndReasonAssistantStop
+	EndReasonPromptDone    = sharedrun.EndReasonPromptDone
+	EndReasonToolTerminate = sharedrun.EndReasonToolTerminate
+	EndReasonLoopStopped   = sharedrun.EndReasonLoopStopped
+
 	AgentEventMessageEnd = agent.EventMessageEnd
 )
 
 var (
-	ErrDuplicateID = sharedrun.ErrDuplicateID
+	ErrDuplicateID     = sharedrun.ErrDuplicateID
+	ErrNoPendingInput  = sharedrun.ErrNoPendingInput
+	ErrNextUnavailable = sharedrun.ErrNextUnavailable
 )
 
 func NewID() ID                                   { return sharedrun.NewID() }

@@ -14,10 +14,12 @@ type AgentEvent struct {
 }
 
 type RunEvent struct {
-	RunID  sharedrun.ID
-	Status sharedrun.Status
-	Cause  sharedrun.Cause
-	Err    error
+	RunID     sharedrun.ID
+	Status    sharedrun.Status
+	Cause     sharedrun.Cause
+	EndReason sharedrun.EndReason
+	Stats     sharedrun.Stats
+	Err       error
 }
 
 type Adapter[Frame any] interface {
