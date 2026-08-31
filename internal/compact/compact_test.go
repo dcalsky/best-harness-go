@@ -27,6 +27,29 @@ func (s *captureSummarizer) Summarize(_ context.Context, messages []message.Mess
 	s.messages = append([]message.Message(nil), messages...)
 	return compact.Summary{Text: "summary"}, nil
 }
+
+func TestNovocabEstimator(t *testing.T) {
+	estimator := compact.NovocabEstimator{}
+	if got := estimator.Estimate(message.User("hello world")); got != 3 {
+		t.Fatalf("estimate=%d, want 3", got)
+	}
+	if got := estimator.Estimate(message.Message{}); got != 1 {
+		t.Fatalf("empty estimate=%d, want 1", got)
+	}
+	invalid := message.User(string([]byte{'a', 0xff, 'b'}))
+	if got := estimator.Estimate(invalid); got < 1 {
+		t.Fatalf("invalid UTF-8 estimate=%d", got)
+	}
+}
+
+func TestCustomTokenEstimator(t *testing.T) {
+	var _ compact.TokenEstimator = compact.TokenEstimatorFunc(func(message.Message) int64 { return 7 })
+	got := compact.Tokens([]message.Message{message.User("ignored")}, compact.TokenEstimatorFunc(func(message.Message) int64 { return 7 }))
+	if got != 7 {
+		t.Fatalf("custom estimate=%d, want 7", got)
+	}
+}
+
 func TestToolBoundaryAndRun(t *testing.T) {
 	m, _ := session.New(harness.NewMemoryPersistence(), session.Options{})
 	_, _ = m.AppendMessage(message.User("old"))

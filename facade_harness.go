@@ -16,6 +16,7 @@ type (
 	ValidatorOption           = core.ValidatorOption
 	NoState                   = core.NoState
 	SessionOptions            = core.SessionOptions
+	SessionOption             = core.SessionOption
 	Session[S any]            = core.Session[S]
 	StartOptions              = core.StartOptions
 	Run[S any]                = core.Run[S]
@@ -48,6 +49,9 @@ var (
 
 func New[S any](opts Options) (*Harness[S], error)         { return core.New[S](opts) }
 func NewStateless(opts Options) (*Harness[NoState], error) { return core.NewStateless(opts) }
+func WithTokenEstimator(estimator TokenEstimator) SessionOption {
+	return core.WithTokenEstimator(estimator)
+}
 func WithValidatorRetryLimit(retries int) ValidatorOption {
 	return core.WithValidatorRetryLimit(retries)
 }

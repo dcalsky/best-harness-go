@@ -20,6 +20,7 @@ var (
 	_ harness.Tool[int, string]       = harness.Tool[int, string]{}
 	_ harness.ArgumentsValidator[int] = func(int) error { return nil }
 	_ harness.StructValidator         = structValidatorStub{}
+	_ harness.SessionOption           = harness.WithTokenEstimator(harness.TokenEstimatorFunc(func(harness.Message) int64 { return 1 }))
 	_ harness.ValidatorOption         = harness.WithValidatorRetryLimit(2)
 	_ harness.ToolOption[int]         = harness.WithArgumentsValidator(func(int) error { return nil })
 	_ harness.ToolOption[int]         = harness.WithArgumentsValidator(func(int) error { return nil }, harness.WithValidatorRetryLimit(2))

@@ -139,8 +139,9 @@ func RegisterBuiltinTools(registry *ToolRegistry, config BuiltinConfig) error {
 // Compaction contracts.
 type (
 	CompactionReason      = compact.Reason
-	TokenEstimator        = compact.Estimator
-	TokenEstimatorFunc    = compact.EstimatorFunc
+	TokenEstimator        = compact.TokenEstimator
+	TokenEstimatorFunc    = compact.TokenEstimatorFunc
+	NovocabEstimator      = compact.NovocabEstimator
 	ApproximateEstimator  = compact.ApproximateEstimator
 	Summarizer            = compact.Summarizer
 	CompactionSummary     = compact.Summary
