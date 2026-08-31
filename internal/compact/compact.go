@@ -2,15 +2,22 @@
 package compact
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
 	"strings"
 
 	json "github.com/dcalsky/best-harness-go/internal/jsoncodec"
 	"github.com/dcalsky/best-harness-go/internal/message"
 	"github.com/dcalsky/best-harness-go/internal/session"
 	novocab "github.com/dcalsky/novocab-go"
+	_ "golang.org/x/image/webp"
 )
 
 type Reason string
@@ -34,11 +41,16 @@ func (f TokenEstimatorFunc) Estimate(m message.Message) int64 { return f(m) }
 type Estimator = TokenEstimator
 type EstimatorFunc = TokenEstimatorFunc
 
-// NovocabEstimator is the default vocabulary-free token estimator.
-type NovocabEstimator struct{}
+// NovocabEstimator is the default vocabulary-free token estimator. Zero-value
+// options select Claude text estimation and Anthropic image estimation.
+type NovocabEstimator struct {
+	TextOptions     novocab.Options
+	ImageGeneration novocab.ImageGeneration
+}
 
-func (NovocabEstimator) Estimate(m message.Message) int64 {
+func (e NovocabEstimator) Estimate(m message.Message) int64 {
 	var text strings.Builder
+	var total int64
 	appendText := func(value string) {
 		if value == "" {
 			return
@@ -49,20 +61,48 @@ func (NovocabEstimator) Estimate(m message.Message) int64 {
 		text.WriteString(value)
 	}
 	for _, c := range m.Content {
+		if c.Type == "image" {
+			width, height, ok := imageDimensions(c.Data)
+			if !ok {
+				continue
+			}
+			tokens, err := novocab.EstimateImageTokens(width, height, e.ImageGeneration)
+			if err == nil {
+				total += tokens
+			}
+			continue
+		}
 		appendText(c.LLMText())
 		appendText(c.Thinking)
 		appendText(string(c.Arguments))
 	}
-	if text.Len() == 0 {
+	if text.Len() > 0 {
+		// v0.2.0 replaces malformed UTF-8 before counting. The zero-value options
+		// are valid, so errors only arise from explicitly invalid options.
+		tokens, err := novocab.Estimate(text.String(), e.TextOptions)
+		if err == nil {
+			total += tokens
+		}
+	}
+	if total < 1 {
 		return 1
 	}
-	// v0.2.0 replaces malformed UTF-8 before counting. The zero-value options
-	// are valid, so the fallback only protects the no-error estimator contract.
-	tokens, err := novocab.Estimate(text.String(), novocab.Options{})
-	if err != nil || tokens < 1 {
-		return 1
+	return total
+}
+
+func imageDimensions(data string) (int64, int64, bool) {
+	raw, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		raw, err = base64.RawStdEncoding.DecodeString(data)
 	}
-	return tokens
+	if err != nil {
+		return 0, 0, false
+	}
+	config, _, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil || config.Width < 1 || config.Height < 1 {
+		return 0, 0, false
+	}
+	return int64(config.Width), int64(config.Height), true
 }
 
 // ApproximateEstimator is retained for source compatibility.

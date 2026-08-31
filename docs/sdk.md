@@ -675,7 +675,9 @@ child, err := session.Fork(ctx, target, harness.SessionOptions{})
 
 ### 上下文压缩与 token 估算
 
-未提供 estimator 时，SDK 使用基于 `novocab-go v0.2.0` 的 `harness.NovocabEstimator`。它不携带 tokenizer 词表，适合上下文压缩的容量估算，但不是 Provider 的精确计费结果。
+未提供 estimator 时，SDK 使用基于 `novocab-go v0.2.0` 的 `harness.NovocabEstimator`。文本按 novocab 的无词表模型估算；可识别的 base64 图片会先解析尺寸，再按 Anthropic 图片公式估算。它适合上下文压缩的容量估算，但不是 Provider 的精确计费结果。
+
+如果模型使用其他图片计费公式，可以设置 `ImageGeneration`（例如 `novocab.ImageOpenAI`）后传入 `WithTokenEstimator`。
 
 应用可以实现 `harness.TokenEstimator`，或使用 `harness.TokenEstimatorFunc` 替换默认实现：
 

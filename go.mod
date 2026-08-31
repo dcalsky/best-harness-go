@@ -8,6 +8,7 @@ require (
 	github.com/openai/openai-go/v3 v3.53.0
 	github.com/rs/xid v1.6.0
 	github.com/tiendc/go-deepcopy v1.7.2
+	golang.org/x/image v0.45.0
 )
 
 require (
