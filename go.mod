@@ -4,9 +4,11 @@ go 1.27.0
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.67.0
+	github.com/dcalsky/novocab-go v0.2.0
 	github.com/openai/openai-go/v3 v3.53.0
 	github.com/rs/xid v1.6.0
 	github.com/tiendc/go-deepcopy v1.7.2
+	golang.org/x/image v0.45.0
 )
 
 require (

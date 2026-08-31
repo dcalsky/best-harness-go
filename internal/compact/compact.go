@@ -2,14 +2,22 @@
 package compact
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
-	"unicode/utf8"
+	"image"
+	_ "image/gif"
+	_ "image/jpeg"
+	_ "image/png"
+	"strings"
 
 	json "github.com/dcalsky/best-harness-go/internal/jsoncodec"
 	"github.com/dcalsky/best-harness-go/internal/message"
 	"github.com/dcalsky/best-harness-go/internal/session"
+	novocab "github.com/dcalsky/novocab-go"
+	_ "golang.org/x/image/webp"
 )
 
 type Reason string
@@ -20,23 +28,86 @@ const (
 	Overflow  Reason = "overflow"
 )
 
-type Estimator interface{ Estimate(message.Message) int64 }
-type EstimatorFunc func(message.Message) int64
+// TokenEstimator estimates the number of tokens occupied by one message.
+// Implementations must return a non-negative value.
+type TokenEstimator interface{ Estimate(message.Message) int64 }
 
-func (f EstimatorFunc) Estimate(m message.Message) int64 { return f(m) }
+// TokenEstimatorFunc adapts a function to TokenEstimator.
+type TokenEstimatorFunc func(message.Message) int64
 
-type ApproximateEstimator struct{}
+func (f TokenEstimatorFunc) Estimate(m message.Message) int64 { return f(m) }
 
-func (ApproximateEstimator) Estimate(m message.Message) int64 {
-	n := 0
-	for _, c := range m.Content {
-		n += utf8.RuneCountInString(c.LLMText()) + utf8.RuneCountInString(c.Thinking) + len(c.Arguments)
+// Estimator and EstimatorFunc preserve the original internal names.
+type Estimator = TokenEstimator
+type EstimatorFunc = TokenEstimatorFunc
+
+// NovocabEstimator is the default vocabulary-free token estimator. Zero-value
+// options select Claude text estimation and Anthropic image estimation.
+type NovocabEstimator struct {
+	TextOptions     novocab.Options
+	ImageGeneration novocab.ImageGeneration
+}
+
+func (e NovocabEstimator) Estimate(m message.Message) int64 {
+	var text strings.Builder
+	var total int64
+	appendText := func(value string) {
+		if value == "" {
+			return
+		}
+		if text.Len() > 0 {
+			text.WriteByte('\n')
+		}
+		text.WriteString(value)
 	}
-	if n == 0 {
+	for _, c := range m.Content {
+		if c.Type == "image" {
+			width, height, ok := imageDimensions(c.Data)
+			if !ok {
+				continue
+			}
+			tokens, err := novocab.EstimateImageTokens(width, height, e.ImageGeneration)
+			if err == nil {
+				total += tokens
+			}
+			continue
+		}
+		appendText(c.LLMText())
+		appendText(c.Thinking)
+		appendText(string(c.Arguments))
+	}
+	if text.Len() > 0 {
+		// v0.2.0 replaces malformed UTF-8 before counting. The zero-value options
+		// are valid, so errors only arise from explicitly invalid options.
+		tokens, err := novocab.Estimate(text.String(), e.TextOptions)
+		if err == nil {
+			total += tokens
+		}
+	}
+	if total < 1 {
 		return 1
 	}
-	return int64((n + 3) / 4)
+	return total
 }
+
+func imageDimensions(data string) (int64, int64, bool) {
+	raw, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		raw, err = base64.RawStdEncoding.DecodeString(data)
+	}
+	if err != nil {
+		return 0, 0, false
+	}
+	config, _, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil || config.Width < 1 || config.Height < 1 {
+		return 0, 0, false
+	}
+	return int64(config.Width), int64(config.Height), true
+}
+
+// ApproximateEstimator is retained for source compatibility.
+// Deprecated: use NovocabEstimator.
+type ApproximateEstimator = NovocabEstimator
 
 type Summarizer interface {
 	Summarize(context.Context, []message.Message, string) (Summary, error)
@@ -60,7 +131,7 @@ type Preparation struct {
 type PrepareHook func(context.Context, *Preparation) error
 type Options struct {
 	ContextWindow, ReserveTokens, KeepRecentTokens int64
-	Estimator                                      Estimator
+	Estimator                                      TokenEstimator
 	Instructions                                   string
 	Hook                                           PrepareHook
 }
@@ -75,9 +146,9 @@ type Result struct {
 var ErrNothingToCompact = errors.New("not enough context to compact")
 var ErrCancelled = errors.New("compaction cancelled")
 
-func Tokens(messages []message.Message, est Estimator) int64 {
+func Tokens(messages []message.Message, est TokenEstimator) int64 {
 	if est == nil {
-		est = ApproximateEstimator{}
+		est = NovocabEstimator{}
 	}
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role == message.RoleAssistant && messages[i].Usage.TotalTokens > 0 {
@@ -131,7 +202,7 @@ func Prepare(entries []session.Entry, reason Reason, opts Options) (Preparation,
 	}
 	est := opts.Estimator
 	if est == nil {
-		est = ApproximateEstimator{}
+		est = NovocabEstimator{}
 	}
 	sum := int64(0)
 	cut := len(ms)

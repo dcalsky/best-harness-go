@@ -714,6 +714,30 @@ child, err := session.Fork(ctx, target, harness.SessionOptions{})
 
 切换分支时，对话和状态会一起恢复。Fork 默认通过当前 Persistence 的 `Fork` 方法继承相同存储方式。运行期间不能切换分支。
 
+### 上下文压缩与 token 估算
+
+未提供 estimator 时，SDK 使用基于 `novocab-go v0.2.0` 的 `harness.NovocabEstimator`。文本按 novocab 的无词表模型估算；可识别的 base64 图片会先解析尺寸，再按 Anthropic 图片公式估算。它适合上下文压缩的容量估算，但不是 Provider 的精确计费结果。
+
+如果模型使用其他图片计费公式，可以设置 `ImageGeneration`（例如 `novocab.ImageOpenAI`）后传入 `WithTokenEstimator`。
+
+应用可以实现 `harness.TokenEstimator`，或使用 `harness.TokenEstimatorFunc` 替换默认实现：
+
+```go
+session, err := h.NewSession(
+	ctx,
+	harness.NewMemoryPersistence(),
+	harness.SessionOptions{
+		Model: &selected,
+	},
+	initialState,
+	harness.WithTokenEstimator(harness.TokenEstimatorFunc(func(message harness.Message) int64 {
+		return estimateForSelectedModel(message)
+	})),
+)
+```
+
+Estimator 必须返回非负值。Provider 已返回 `Usage.TotalTokens` 时，总量判断优先使用该值；estimator 仍用于决定压缩后保留哪些最近消息。
+
 ## 加载项目资源
 
 资源可以提供项目说明、系统提示词、技能和提示词模板。SDK 只读取已注册的 `harness.ResourceLoader`。

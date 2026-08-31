@@ -1,7 +1,13 @@
 package compact_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"image"
+	"image/gif"
+	"image/jpeg"
+	"image/png"
 	"strings"
 	"testing"
 
@@ -9,6 +15,7 @@ import (
 	"github.com/dcalsky/best-harness-go/internal/compact"
 	"github.com/dcalsky/best-harness-go/internal/message"
 	"github.com/dcalsky/best-harness-go/internal/session"
+	novocab "github.com/dcalsky/novocab-go"
 )
 
 type oneToken struct{}
@@ -27,6 +34,89 @@ func (s *captureSummarizer) Summarize(_ context.Context, messages []message.Mess
 	s.messages = append([]message.Message(nil), messages...)
 	return compact.Summary{Text: "summary"}, nil
 }
+
+func TestNovocabEstimator(t *testing.T) {
+	estimator := compact.NovocabEstimator{}
+	if got := estimator.Estimate(message.User("hello world")); got != 3 {
+		t.Fatalf("estimate=%d, want 3", got)
+	}
+	if got := estimator.Estimate(message.Message{}); got != 1 {
+		t.Fatalf("empty estimate=%d, want 1", got)
+	}
+	invalid := message.User(string([]byte{'a', 0xff, 'b'}))
+	if got := estimator.Estimate(invalid); got < 1 {
+		t.Fatalf("invalid UTF-8 estimate=%d", got)
+	}
+}
+
+func TestNovocabEstimatorIncludesImages(t *testing.T) {
+	want, err := novocab.EstimateImageTokens(256, 512, novocab.ImageAnthropic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, format := range []string{"png", "jpeg", "gif", "webp"} {
+		t.Run(format, func(t *testing.T) {
+			content := message.Image(testImageData(t, format), "image/"+format)
+			got := (compact.NovocabEstimator{}).Estimate(message.Message{Content: []message.Content{content}})
+			if got != want {
+				t.Fatalf("estimate=%d, want %d", got, want)
+			}
+		})
+	}
+}
+
+func TestNovocabEstimatorUsesConfiguredImageGeneration(t *testing.T) {
+	data := testImageData(t, "png")
+	imageMessage := message.Message{Content: []message.Content{message.Image(data, "image/png")}}
+	got := (compact.NovocabEstimator{ImageGeneration: novocab.ImageOpenAI}).Estimate(imageMessage)
+	want, err := novocab.EstimateImageTokens(256, 512, novocab.ImageOpenAI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("estimate=%d, want %d", got, want)
+	}
+}
+
+func testImageData(t *testing.T, format string) string {
+	t.Helper()
+	if format == "webp" {
+		// A minimal VP8X header is sufficient for DecodeConfig and keeps this
+		// test independent of a WebP encoder.
+		raw := []byte{
+			'R', 'I', 'F', 'F', 22, 0, 0, 0, 'W', 'E', 'B', 'P',
+			'V', 'P', '8', 'X', 10, 0, 0, 0, 1 << 4, 0, 0, 0,
+			0xff, 0x00, 0x00, 0xff, 0x01, 0x00,
+		}
+		return base64.StdEncoding.EncodeToString(raw)
+	}
+	img := image.NewRGBA(image.Rect(0, 0, 256, 512))
+	var out bytes.Buffer
+	var err error
+	switch format {
+	case "png":
+		err = png.Encode(&out, img)
+	case "jpeg":
+		err = jpeg.Encode(&out, img, &jpeg.Options{Quality: 90})
+	case "gif":
+		err = gif.Encode(&out, img, nil)
+	default:
+		t.Fatalf("unsupported test image format %q", format)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return base64.StdEncoding.EncodeToString(out.Bytes())
+}
+
+func TestCustomTokenEstimator(t *testing.T) {
+	var _ compact.TokenEstimator = compact.TokenEstimatorFunc(func(message.Message) int64 { return 7 })
+	got := compact.Tokens([]message.Message{message.User("ignored")}, compact.TokenEstimatorFunc(func(message.Message) int64 { return 7 }))
+	if got != 7 {
+		t.Fatalf("custom estimate=%d, want 7", got)
+	}
+}
+
 func TestToolBoundaryAndRun(t *testing.T) {
 	m, _ := session.New(harness.NewMemoryPersistence(), session.Options{})
 	_, _ = m.AppendMessage(message.User("old"))

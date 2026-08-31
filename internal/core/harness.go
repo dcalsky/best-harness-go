@@ -284,6 +284,44 @@ type SessionOptions struct {
 	Compaction             CompactionOptions
 	Generation             GenerationConfig
 }
+
+// SessionOption applies optional configuration after the base SessionOptions.
+type SessionOption struct {
+	apply func(*SessionOptions)
+	err   error
+}
+
+// WithTokenEstimator overrides the estimator used for compaction thresholds
+// and recent-message retention in this session.
+func WithTokenEstimator(estimator compact.TokenEstimator) SessionOption {
+	if estimator == nil {
+		return SessionOption{err: errors.New("token estimator is required")}
+	}
+	value := reflect.ValueOf(estimator)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		if value.IsNil() {
+			return SessionOption{err: errors.New("token estimator is required")}
+		}
+	}
+	return SessionOption{apply: func(options *SessionOptions) {
+		options.Compaction.Estimator = estimator
+	}}
+}
+
+func applySessionOptions(options SessionOptions, overrides []SessionOption) (SessionOptions, error) {
+	for _, override := range overrides {
+		if override.err != nil {
+			return SessionOptions{}, override.err
+		}
+		if override.apply == nil {
+			return SessionOptions{}, errors.New("session option is required")
+		}
+		override.apply(&options)
+	}
+	return options, nil
+}
+
 type Session[S any] struct {
 	mu                       sync.Mutex
 	harness                  *Harness[S]
@@ -490,7 +528,12 @@ func (s *Session[S]) commitState(updates []func(*S)) error {
 	return nil
 }
 
-func (h *Harness[S]) NewSession(ctx context.Context, persistence Persistence, opts SessionOptions, initialState S) (*Session[S], error) {
+func (h *Harness[S]) NewSession(ctx context.Context, persistence Persistence, opts SessionOptions, initialState S, options ...SessionOption) (*Session[S], error) {
+	var err error
+	opts, err = applySessionOptions(opts, options)
+	if err != nil {
+		return nil, err
+	}
 	raw, err := marshalState(initialState)
 	if err != nil {
 		return nil, err
@@ -501,25 +544,38 @@ func (h *Harness[S]) NewSession(ctx context.Context, persistence Persistence, op
 	}
 	return h.sessionFromStore(ctx, m, opts)
 }
-func (h *Harness[S]) NewSessionWithManager(ctx context.Context, manager *SessionManager, opts SessionOptions) (*Session[S], error) {
+func (h *Harness[S]) NewSessionWithManager(ctx context.Context, manager *SessionManager, opts SessionOptions, options ...SessionOption) (*Session[S], error) {
 	if manager == nil {
 		return nil, errors.New("session manager is required")
 	}
+	var err error
+	opts, err = applySessionOptions(opts, options)
+	if err != nil {
+		return nil, err
+	}
 	return h.sessionFromStore(ctx, manager, opts)
 }
-func (h *Harness[S]) OpenSession(ctx context.Context, path string) (*Session[S], error) {
+func (h *Harness[S]) OpenSession(ctx context.Context, path string, options ...SessionOption) (*Session[S], error) {
+	opts, err := applySessionOptions(SessionOptions{}, options)
+	if err != nil {
+		return nil, err
+	}
 	m, err := openFileManager(path)
 	if err != nil {
 		return nil, err
 	}
-	return h.sessionFromStore(ctx, m, SessionOptions{})
+	return h.sessionFromStore(ctx, m, opts)
 }
-func (h *Harness[S]) ResumeLatest(ctx context.Context, directory, cwd string) (*Session[S], error) {
+func (h *Harness[S]) ResumeLatest(ctx context.Context, directory, cwd string, options ...SessionOption) (*Session[S], error) {
+	opts, err := applySessionOptions(SessionOptions{}, options)
+	if err != nil {
+		return nil, err
+	}
 	m, err := resumeLatestFileManager(ctx, directory, cwd)
 	if err != nil {
 		return nil, err
 	}
-	return h.sessionFromStore(ctx, m, SessionOptions{})
+	return h.sessionFromStore(ctx, m, opts)
 }
 func (h *Harness[S]) ListSessions(ctx context.Context, directory string) ([]SessionInfo, error) {
 	return listFileSessions(ctx, directory)
@@ -1534,9 +1590,14 @@ func (s *Session[S]) Navigate(ctx context.Context, id *SessionEntryID, options .
 	}
 	return nil
 }
-func (s *Session[S]) Fork(ctx context.Context, id SessionEntryID, opts SessionOptions) (*Session[S], error) {
+func (s *Session[S]) Fork(ctx context.Context, id SessionEntryID, opts SessionOptions, options ...SessionOption) (*Session[S], error) {
 	if s.busy() {
 		return nil, agent.ErrBusy
+	}
+	var err error
+	opts, err = applySessionOptions(opts, options)
+	if err != nil {
+		return nil, err
 	}
 	fork, err := s.store.Fork(ctx, id, store.Options{ID: opts.ID, Cwd: opts.Cwd})
 	if err != nil {
