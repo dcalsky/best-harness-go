@@ -1,0 +1,3 @@
+# FFF's released Windows library expects LF-delimited fixture content. Keep the
+# vendored integration fixture stable across checkout platforms.
+e2e/testdata/example-repo/** text eol=lf
