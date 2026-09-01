@@ -24,6 +24,27 @@ type captureProvider struct {
 	requests []harness.Request
 }
 
+func TestHarnessCloseReleasesBuiltinSearchPool(t *testing.T) {
+	tools := harness.NewToolRegistry()
+	h, err := harness.NewStateless(harness.Options{Tools: tools})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.RegisterBuiltinTools(harness.BuiltinConfig{Cwd: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, err = tools.Execute(context.Background(), harness.ToolCall{Name: "grep", Arguments: json.RawMessage(`{"pattern":"TODO"}`)}, nil)
+	if err == nil || !strings.Contains(err.Error(), "closed") {
+		t.Fatalf("grep after Harness.Close error=%v", err)
+	}
+	if err := h.RegisterBuiltinTools(harness.BuiltinConfig{Cwd: t.TempDir()}); err == nil {
+		t.Fatal("expected registration on closed Harness to fail")
+	}
+}
+
 func startSession(t *testing.T, s *harness.Session[harness.NoState], p harness.Prompt) *harness.Run[harness.NoState] {
 	t.Helper()
 	r, err := s.Start(context.Background(), p, harness.StartOptions{})

@@ -4,10 +4,10 @@ package builtin
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"mime"
 	"os"
@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dcalsky/best-harness-go/internal/fff"
 	"github.com/dcalsky/best-harness-go/internal/message"
 	"github.com/dcalsky/best-harness-go/internal/tool"
 )
@@ -51,6 +52,18 @@ type Config struct {
 	OutputStore    OutputStore
 	MaxOutputBytes int
 	MutationQueue  *MutationQueue
+	// Search overrides the native FFF backend. It is primarily useful for
+	// deterministic tests and embedded callers with their own FFF lifecycle.
+	Search fff.Searcher
+	// FFFLibraryPath is an optional absolute path to the FFF C library. When
+	// empty, the pinned prebuilt release is downloaded and verified.
+	FFFLibraryPath string
+	// FFFScanTimeout bounds the first-call wait for FFF's initial index scan.
+	FFFScanTimeout time.Duration
+	// FFFCacheDir overrides the cache used for the pinned prebuilt FFF library.
+	FFFCacheDir string
+	// FFFMaxRoots bounds the number of live indexed roots and file watchers.
+	FFFMaxRoots int
 }
 
 func (c Config) defaults() Config {
@@ -66,6 +79,12 @@ func (c Config) defaults() Config {
 	if c.MutationQueue == nil {
 		c.MutationQueue = NewMutationQueue()
 	}
+	if c.FFFLibraryPath == "" {
+		c.FFFLibraryPath = os.Getenv("BEST_HARNESS_FFF_LIBRARY")
+	}
+	if c.FFFCacheDir == "" {
+		c.FFFCacheDir = os.Getenv("BEST_HARNESS_FFF_CACHE_DIR")
+	}
 	return c
 }
 func resolve(c Config, p string) string {
@@ -73,6 +92,37 @@ func resolve(c Config, p string) string {
 		return filepath.Clean(p)
 	}
 	return filepath.Join(c.Cwd, p)
+}
+
+func searcher(c Config) (fff.Searcher, error) {
+	if c.Search != nil {
+		return c.Search, nil
+	}
+	switch c.FileSystem.(type) {
+	case OSFileSystem, *OSFileSystem:
+	default:
+		return nil, errors.New("FFF-backed find and grep require OSFileSystem; provide Config.Search for a custom filesystem")
+	}
+	return fff.NewPool(fff.Options{
+		LibraryPath: c.FFFLibraryPath,
+		CacheDir:    c.FFFCacheDir,
+		ScanTimeout: c.FFFScanTimeout,
+		MaxRoots:    c.FFFMaxRoots,
+	}), nil
+}
+
+func prepareSearch(c Config) (Config, *fff.Pool, error) {
+	c = c.defaults()
+	if c.Search != nil {
+		return c, nil, nil
+	}
+	engine, err := searcher(c)
+	if err != nil {
+		return Config{}, nil, err
+	}
+	pool := engine.(*fff.Pool)
+	c.Search = pool
+	return c, pool, nil
 }
 
 type Truncation struct {
@@ -324,75 +374,160 @@ type GrepParams struct {
 	Path       string `json:"path,omitempty"`
 	Glob       string `json:"glob,omitempty"`
 	IgnoreCase bool   `json:"ignoreCase,omitempty"`
+	Literal    bool   `json:"literal,omitempty"`
+	Context    int    `json:"context,omitempty"`
+	Cursor     string `json:"cursor,omitempty"`
 	MaxResults int    `json:"maxResults,omitempty"`
 }
 type GrepDetails struct {
-	Matches, Files int
+	Matches, Files     int
+	Cursor             string `json:"cursor,omitempty"`
+	RegexFallbackError string `json:"regexFallbackError,omitempty"`
 	Truncation
+}
+
+const (
+	defaultGrepPageSize = 20
+	maxGrepPageSize     = 50
+	maxGrepPerFile      = 200
+	defaultGrepBudget   = 10 * time.Second
+	maxGrepContext      = 20
+	defaultFindPageSize = 30
+)
+
+func searchCursor(kind string, position int, fingerprint string) string {
+	payload := fmt.Sprintf("%s:%d:%s", kind, position, fingerprint)
+	return base64.RawURLEncoding.EncodeToString([]byte(payload))
+}
+
+func parseSearchCursor(value, kind, fingerprint string) (int, error) {
+	if value == "" {
+		return 0, nil
+	}
+	b, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return 0, errors.New("invalid FFF cursor")
+	}
+	parts := strings.Split(string(b), ":")
+	if len(parts) != 3 || parts[0] != kind || parts[2] != fingerprint {
+		return 0, errors.New("FFF cursor does not match this search")
+	}
+	position, err := strconv.Atoi(parts[1])
+	if err != nil || position < 0 {
+		return 0, errors.New("invalid FFF cursor position")
+	}
+	return position, nil
+}
+
+func cursorFingerprint(values ...string) string {
+	hash := sha256.New()
+	for _, value := range values {
+		_, _ = hash.Write([]byte(value))
+		_, _ = hash.Write([]byte{0})
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)[:8])
+}
+
+func grepBudget(ctx context.Context) time.Duration {
+	budget := defaultGrepBudget
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining < budget {
+			budget = remaining
+		}
+	}
+	if budget < time.Millisecond {
+		return time.Millisecond
+	}
+	return budget
 }
 
 func Grep(c Config) tool.Tool[GrepParams, GrepDetails] {
 	c = c.defaults()
-	return tool.Tool[GrepParams, GrepDetails]{Name: "grep", Description: "Search text files with a regular expression.", ExecutionMode: tool.Parallel, Execute: func(ctx context.Context, _ tool.ToolCall, p GrepParams, _ tool.Update[GrepDetails]) (tool.ToolResult[GrepDetails], error) {
-		pattern := p.Pattern
-		if p.IgnoreCase {
-			pattern = "(?i)" + pattern
+	engine, engineErr := searcher(c)
+	return tool.Tool[GrepParams, GrepDetails]{Name: "grep", Description: "Search indexed text files with FFF.", ExecutionMode: tool.Parallel, Execute: func(ctx context.Context, _ tool.ToolCall, p GrepParams, _ tool.Update[GrepDetails]) (tool.ToolResult[GrepDetails], error) {
+		if engineErr != nil {
+			return tool.ToolResult[GrepDetails]{}, engineErr
 		}
-		re, err := regexp.Compile(pattern)
-		if err != nil {
+		if err := ctx.Err(); err != nil {
 			return tool.ToolResult[GrepDetails]{}, err
 		}
+		rawPattern := p.Pattern
+		pattern := p.Pattern
 		root := resolve(c, p.Path)
 		if p.Path == "" {
 			root = c.Cwd
 		}
 		limit := p.MaxResults
 		if limit <= 0 {
-			limit = 1000
+			limit = defaultGrepPageSize
+		}
+		if limit > maxGrepPageSize {
+			limit = maxGrepPageSize
+		}
+		mode := fff.GrepRegex
+		if p.Literal && !p.IgnoreCase {
+			mode = fff.GrepPlain
+		}
+		if p.IgnoreCase {
+			if p.Literal {
+				pattern = regexp.QuoteMeta(pattern)
+			}
+			pattern = "(?i)" + pattern
+		}
+		if mode == fff.GrepRegex {
+			if _, err := regexp.Compile(pattern); err != nil {
+				return tool.ToolResult[GrepDetails]{}, err
+			}
+		}
+		contextLines := p.Context
+		if contextLines < 0 {
+			contextLines = 0
+		} else if contextLines > maxGrepContext {
+			contextLines = maxGrepContext
+		}
+		fingerprint := cursorFingerprint(root, rawPattern, p.Glob, strconv.FormatBool(p.IgnoreCase), strconv.FormatBool(p.Literal), strconv.Itoa(contextLines), strconv.Itoa(limit))
+		fileOffset, err := parseSearchCursor(p.Cursor, "g", fingerprint)
+		if err != nil {
+			return tool.ToolResult[GrepDetails]{}, err
+		}
+		result, err := engine.Grep(ctx, root, fff.GrepOptions{
+			Pattern:     pattern,
+			Constraints: p.Glob,
+			Mode:        mode,
+			// The existing tool was case-sensitive by default. Preserve that
+			// contract rather than inheriting FFF's smart-case default.
+			SmartCase:     false,
+			Limit:         limit,
+			FileOffset:    fileOffset,
+			TimeBudget:    grepBudget(ctx),
+			MaxPerFile:    maxGrepPerFile,
+			BeforeContext: contextLines,
+			AfterContext:  contextLines,
+		})
+		if err != nil {
+			return tool.ToolResult[GrepDetails]{}, err
 		}
 		var out strings.Builder
-		details := GrepDetails{}
-		err = c.FileSystem.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				return nil
+		files := make(map[string]struct{})
+		for _, match := range result.Matches {
+			files[match.Path] = struct{}{}
+			for index, line := range match.ContextBefore {
+				lineNumber := match.Line - len(match.ContextBefore) + index
+				fmt.Fprintf(&out, "%s:%d-:%s\n", match.Path, lineNumber, line)
 			}
-			if err := ctx.Err(); err != nil {
-				return err
+			fmt.Fprintf(&out, "%s:%d:%s\n", match.Path, match.Line, match.Text)
+			for index, line := range match.ContextAfter {
+				fmt.Fprintf(&out, "%s:%d-:%s\n", match.Path, match.Line+index+1, line)
 			}
-			if d.IsDir() {
-				if d.Name() == ".git" {
-					return fs.SkipDir
-				}
-				return nil
-			}
-			if p.Glob != "" {
-				ok, _ := filepath.Match(p.Glob, d.Name())
-				if !ok {
-					return nil
-				}
-			}
-			b, err := c.FileSystem.ReadFile(path)
-			if err != nil || bytes.IndexByte(b, 0) >= 0 {
-				return nil
-			}
-			fileMatched := false
-			for i, line := range strings.Split(string(b), "\n") {
-				if re.MatchString(line) {
-					if !fileMatched {
-						details.Files++
-						fileMatched = true
-					}
-					details.Matches++
-					fmt.Fprintf(&out, "%s:%d:%s\n", path, i+1, line)
-					if details.Matches >= limit {
-						return io.EOF
-					}
-				}
-			}
-			return nil
-		})
-		if err != nil && !errors.Is(err, io.EOF) {
-			return tool.ToolResult[GrepDetails]{}, err
+		}
+		details := GrepDetails{Matches: len(result.Matches), Files: len(files), RegexFallbackError: result.RegexFallbackError}
+		if result.NextFilePage > 0 {
+			details.Cursor = searchCursor("g", result.NextFilePage, fingerprint)
+			fmt.Fprintf(&out, "\nContinue with cursor=\"%s\"", details.Cursor)
+		}
+		if result.RegexFallbackError != "" {
+			fmt.Fprintf(&out, "\nInvalid regex: %s; FFF used literal matching", result.RegexFallbackError)
 		}
 		text, tr := truncate(ctx, c, "grep-output", []byte(strings.TrimSuffix(out.String(), "\n")))
 		details.Truncation = tr
@@ -403,52 +538,51 @@ func Grep(c Config) tool.Tool[GrepParams, GrepDetails] {
 type FindParams struct {
 	Pattern    string `json:"pattern"`
 	Path       string `json:"path,omitempty"`
+	Cursor     string `json:"cursor,omitempty"`
 	MaxResults int    `json:"maxResults,omitempty"`
 }
 type FindDetails struct {
 	Results int
+	Cursor  string `json:"cursor,omitempty"`
 	Truncation
 }
 
 func Find(c Config) tool.Tool[FindParams, FindDetails] {
 	c = c.defaults()
-	return tool.Tool[FindParams, FindDetails]{Name: "find", Description: "Find files by name or path pattern.", ExecutionMode: tool.Parallel, Execute: func(ctx context.Context, _ tool.ToolCall, p FindParams, _ tool.Update[FindDetails]) (tool.ToolResult[FindDetails], error) {
+	engine, engineErr := searcher(c)
+	return tool.Tool[FindParams, FindDetails]{Name: "find", Description: "Find files with FFF's indexed fuzzy and glob search.", ExecutionMode: tool.Parallel, Execute: func(ctx context.Context, _ tool.ToolCall, p FindParams, _ tool.Update[FindDetails]) (tool.ToolResult[FindDetails], error) {
+		if engineErr != nil {
+			return tool.ToolResult[FindDetails]{}, engineErr
+		}
 		root := resolve(c, p.Path)
 		if p.Path == "" {
 			root = c.Cwd
 		}
 		limit := p.MaxResults
 		if limit <= 0 {
-			limit = 1000
+			limit = defaultFindPageSize
 		}
-		var found []string
-		err := c.FileSystem.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				return nil
-			}
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if d.IsDir() && d.Name() == ".git" {
-				return fs.SkipDir
-			}
-			rel, _ := filepath.Rel(root, path)
-			ok, _ := filepath.Match(p.Pattern, d.Name())
-			pathOK, _ := filepath.Match(p.Pattern, rel)
-			if ok || pathOK || strings.Contains(rel, p.Pattern) {
-				found = append(found, rel)
-				if len(found) >= limit {
-					return io.EOF
-				}
-			}
-			return nil
-		})
-		if err != nil && !errors.Is(err, io.EOF) {
+		fingerprint := cursorFingerprint(root, p.Pattern, strconv.Itoa(limit))
+		page, err := parseSearchCursor(p.Cursor, "f", fingerprint)
+		if err != nil {
 			return tool.ToolResult[FindDetails]{}, err
 		}
-		sort.Strings(found)
+		result, err := engine.Find(ctx, root, fff.FindOptions{Pattern: p.Pattern, Limit: limit, Page: page})
+		if err != nil {
+			return tool.ToolResult[FindDetails]{}, err
+		}
+		found := make([]string, 0, len(result.Files))
+		for _, file := range result.Files {
+			found = append(found, file.Path)
+		}
+		details := FindDetails{Results: len(found)}
+		if result.NextPage > 0 {
+			details.Cursor = searchCursor("f", result.NextPage, fingerprint)
+			found = append(found, fmt.Sprintf("Continue with cursor=\"%s\"", details.Cursor))
+		}
 		text, tr := truncate(ctx, c, "find-output", []byte(strings.Join(found, "\n")))
-		return tool.ToolResult[FindDetails]{Content: []message.Content{message.Text(text)}, Details: FindDetails{Results: len(found), Truncation: tr}}, nil
+		details.Truncation = tr
+		return tool.ToolResult[FindDetails]{Content: []message.Content{message.Text(text)}, Details: details}, nil
 	}}
 }
 
@@ -490,23 +624,43 @@ func LS(c Config) tool.Tool[LSParams, LSDetails] {
 }
 
 func RegisterAll(r *tool.Registry, c Config) error {
+	_, err := RegisterAllManaged(r, c)
+	return err
+}
+
+// RegisterAllManaged registers the built-ins with one shared FFF pool and
+// returns that pool so the owning Harness can close its native resources.
+func RegisterAllManaged(r *tool.Registry, c Config) (*fff.Pool, error) {
+	c, pool, err := prepareSearch(c)
+	if err != nil {
+		return nil, err
+	}
+	fail := func(err error) (*fff.Pool, error) {
+		if pool != nil {
+			_ = pool.Close()
+		}
+		return nil, err
+	}
 	if err := r.Register(Read(c)); err != nil {
-		return err
+		return fail(err)
 	}
 	if err := r.Register(Bash(c)); err != nil {
-		return err
+		return fail(err)
 	}
 	if err := r.Register(Edit(c)); err != nil {
-		return err
+		return fail(err)
 	}
 	if err := r.Register(Write(c)); err != nil {
-		return err
+		return fail(err)
 	}
 	if err := r.Register(Grep(c)); err != nil {
-		return err
+		return fail(err)
 	}
 	if err := r.Register(Find(c)); err != nil {
-		return err
+		return fail(err)
 	}
-	return r.Register(LS(c))
+	if err := r.Register(LS(c)); err != nil {
+		return fail(err)
+	}
+	return pool, nil
 }

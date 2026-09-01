@@ -39,6 +39,7 @@ type (
 var (
 	ErrNoModel       = core.ErrNoModel
 	ErrNoProvider    = core.ErrNoProvider
+	ErrHarnessClosed = core.ErrHarnessClosed
 	ErrNoShell       = core.ErrNoShell
 	RetryAttempts    = core.RetryAttempts
 	RetryDelay       = core.RetryDelay

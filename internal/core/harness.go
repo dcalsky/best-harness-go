@@ -31,6 +31,7 @@ import (
 var ErrNoModel = errors.New("no model selected")
 var ErrNoProvider = errors.New("provider is not registered")
 var ErrNoShell = errors.New("shell executor is not configured")
+var ErrHarnessClosed = errors.New("harness is closed")
 
 var RetryAttempts = Setting[int]{Key: "retry.attempts", Default: 2, Validate: func(v int) error {
 	if v < 0 {
@@ -80,6 +81,10 @@ type Harness[S any] struct {
 	extensions *ExtensionRegistry[S]
 	settings   *Settings
 	shell      ShellExecutor
+
+	resourceMu      sync.Mutex
+	resourceClosers []func() error
+	closed          bool
 }
 
 // ToolOption configures typed behavior for a tool registered through Harness.
@@ -191,7 +196,42 @@ func (h *Harness[S]) RegisterProvider(name string, p Provider) error {
 	return h.extensions.RegisterProvider(name, p)
 }
 func (h *Harness[S]) RegisterBuiltinTools(config BuiltinConfig) error {
-	return builtin.RegisterAll(h.extensions.Tools, config)
+	h.resourceMu.Lock()
+	defer h.resourceMu.Unlock()
+	if h.closed {
+		return ErrHarnessClosed
+	}
+	pool, err := builtin.RegisterAllManaged(h.extensions.Tools, config)
+	if err != nil {
+		return err
+	}
+	if pool != nil {
+		h.resourceClosers = append(h.resourceClosers, pool.Close)
+	}
+	return nil
+}
+
+// Close releases native resources owned by the Harness, including FFF indexes
+// and file-system watchers created by RegisterBuiltinTools. Sessions must be
+// closed before their Harness.
+func (h *Harness[S]) Close() error {
+	h.resourceMu.Lock()
+	if h.closed {
+		h.resourceMu.Unlock()
+		return nil
+	}
+	h.closed = true
+	closers := append([]func() error(nil), h.resourceClosers...)
+	h.resourceClosers = nil
+	h.resourceMu.Unlock()
+
+	var errs []error
+	for index := len(closers) - 1; index >= 0; index-- {
+		if err := closers[index](); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 func (h *Harness[S]) RegisterExtension(ext Extension[S]) error {
 	if ext == nil {

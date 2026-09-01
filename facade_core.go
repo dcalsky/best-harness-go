@@ -10,6 +10,7 @@ import (
 	"github.com/dcalsky/best-harness-go/internal/builtin"
 	"github.com/dcalsky/best-harness-go/internal/compact"
 	"github.com/dcalsky/best-harness-go/internal/extension"
+	"github.com/dcalsky/best-harness-go/internal/fff"
 	"github.com/dcalsky/best-harness-go/internal/invocation"
 	"github.com/dcalsky/best-harness-go/internal/jsonschema"
 	"github.com/dcalsky/best-harness-go/internal/provider/anthropic"
@@ -99,32 +100,49 @@ func InvocationContextFrom[S any](ctx context.Context) (Context[S], error) {
 
 // Built-in tool contracts and constructors.
 type (
-	BuiltinConfig   = builtin.Config
-	FileSystem      = builtin.FileSystem
-	OSFileSystem    = builtin.OSFileSystem
-	OutputStore     = builtin.OutputStore
-	MutationQueue   = builtin.MutationQueue
-	ShellExecutor   = builtin.ShellExecutor
-	OSShellExecutor = builtin.OSShellExecutor
-	ShellResult     = builtin.ShellResult
-	Truncation      = builtin.Truncation
-	ReadParams      = builtin.ReadParams
-	ReadDetails     = builtin.ReadDetails
-	WriteParams     = builtin.WriteParams
-	WriteDetails    = builtin.WriteDetails
-	EditParams      = builtin.EditParams
-	EditDetails     = builtin.EditDetails
-	BashParams      = builtin.BashParams
-	BashDetails     = builtin.BashDetails
-	GrepParams      = builtin.GrepParams
-	GrepDetails     = builtin.GrepDetails
-	FindParams      = builtin.FindParams
-	FindDetails     = builtin.FindDetails
-	LSParams        = builtin.LSParams
-	LSDetails       = builtin.LSDetails
+	BuiltinConfig           = builtin.Config
+	FileSystem              = builtin.FileSystem
+	OSFileSystem            = builtin.OSFileSystem
+	OutputStore             = builtin.OutputStore
+	MutationQueue           = builtin.MutationQueue
+	ShellExecutor           = builtin.ShellExecutor
+	OSShellExecutor         = builtin.OSShellExecutor
+	ShellResult             = builtin.ShellResult
+	Truncation              = builtin.Truncation
+	ReadParams              = builtin.ReadParams
+	ReadDetails             = builtin.ReadDetails
+	WriteParams             = builtin.WriteParams
+	WriteDetails            = builtin.WriteDetails
+	EditParams              = builtin.EditParams
+	EditDetails             = builtin.EditDetails
+	BashParams              = builtin.BashParams
+	BashDetails             = builtin.BashDetails
+	GrepParams              = builtin.GrepParams
+	GrepDetails             = builtin.GrepDetails
+	FindParams              = builtin.FindParams
+	FindDetails             = builtin.FindDetails
+	LSParams                = builtin.LSParams
+	LSDetails               = builtin.LSDetails
+	FFFSearcher             = fff.Searcher
+	FFFOptions              = fff.Options
+	FFFPool                 = fff.Pool
+	FFFPathSearchOptions    = fff.FindOptions
+	FFFPathSearchResult     = fff.FindResult
+	FFFFile                 = fff.File
+	FFFContentSearchOptions = fff.GrepOptions
+	FFFContentSearchResult  = fff.GrepResult
+	FFFMatch                = fff.Match
+	FFFGrepMode             = fff.GrepMode
+)
+
+const (
+	FFFReleaseVersion = fff.ReleaseVersion
+	FFFGrepPlain      = fff.GrepPlain
+	FFFGrepRegex      = fff.GrepRegex
 )
 
 func NewMutationQueue() *MutationQueue                               { return builtin.NewMutationQueue() }
+func NewFFFPool(options FFFOptions) *FFFPool                         { return fff.NewPool(options) }
 func ReadTool(config BuiltinConfig) Tool[ReadParams, ReadDetails]    { return builtin.Read(config) }
 func WriteTool(config BuiltinConfig) Tool[WriteParams, WriteDetails] { return builtin.Write(config) }
 func EditTool(config BuiltinConfig) Tool[EditParams, EditDetails]    { return builtin.Edit(config) }
@@ -134,6 +152,9 @@ func FindTool(config BuiltinConfig) Tool[FindParams, FindDetails]    { return bu
 func LSTool(config BuiltinConfig) Tool[LSParams, LSDetails]          { return builtin.LS(config) }
 func RegisterBuiltinTools(registry *ToolRegistry, config BuiltinConfig) error {
 	return builtin.RegisterAll(registry, config)
+}
+func RegisterBuiltinToolsManaged(registry *ToolRegistry, config BuiltinConfig) (*FFFPool, error) {
+	return builtin.RegisterAllManaged(registry, config)
 }
 
 // Compaction contracts.

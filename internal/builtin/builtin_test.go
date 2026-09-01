@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/dcalsky/best-harness-go/internal/builtin"
+	"github.com/dcalsky/best-harness-go/internal/fff"
 	"github.com/dcalsky/best-harness-go/internal/tool"
 )
 
@@ -17,6 +18,16 @@ type fakeShell struct{}
 func (fakeShell) Execute(_ context.Context, _ string, _ string, update func(string, []byte)) (builtin.ShellResult, error) {
 	update("stdout", []byte("partial"))
 	return builtin.ShellResult{Stdout: []byte("out"), Stderr: []byte("err"), ExitCode: 2}, nil
+}
+
+type fakeSearch struct{}
+
+func (fakeSearch) Find(_ context.Context, _ string, _ fff.FindOptions) (fff.FindResult, error) {
+	return fff.FindResult{Files: []fff.File{{Path: "a.txt"}}, TotalMatched: 1}, nil
+}
+
+func (fakeSearch) Grep(_ context.Context, _ string, _ fff.GrepOptions) (fff.GrepResult, error) {
+	return fff.GrepResult{Matches: []fff.Match{{Path: "a.txt", Line: 2, Text: "gamma"}}}, nil
 }
 
 func execute[P, D any](t *testing.T, def tool.Tool[P, D], raw string) tool.Result {
@@ -33,7 +44,7 @@ func execute[P, D any](t *testing.T, def tool.Tool[P, D], raw string) tool.Resul
 }
 func TestWriteEditReadGrepFindLS(t *testing.T) {
 	dir := t.TempDir()
-	c := builtin.Config{Cwd: dir, MaxOutputBytes: 80}
+	c := builtin.Config{Cwd: dir, MaxOutputBytes: 80, Search: fakeSearch{}}
 	execute(t, builtin.Write(c), `{"path":"a.txt","content":"alpha\nbeta\n"}`)
 	execute(t, builtin.Edit(c), `{"path":"a.txt","oldText":"beta","newText":"gamma"}`)
 	read := execute(t, builtin.Read(c), `{"path":"a.txt"}`)

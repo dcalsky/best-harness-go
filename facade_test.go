@@ -14,6 +14,27 @@ type facadeParams struct {
 	Text string `json:"text"`
 }
 
+func TestFFFManagedFacade(t *testing.T) {
+	if harness.FFFReleaseVersion != "0.10.6" {
+		t.Fatalf("FFF release=%q", harness.FFFReleaseVersion)
+	}
+	pool := harness.NewFFFPool(harness.FFFOptions{MaxRoots: 1})
+	if err := pool.Close(); err != nil {
+		t.Fatal(err)
+	}
+	registry := harness.NewToolRegistry()
+	managed, err := harness.RegisterBuiltinToolsManaged(registry, harness.BuiltinConfig{Cwd: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if managed == nil {
+		t.Fatal("expected managed FFF pool")
+	}
+	if err := managed.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type facadeStructValidator struct {
 	validate func(any) error
 }
