@@ -1,4 +1,4 @@
-//go:build (!cgo && (darwin || linux)) || (!darwin && !linux && !windows) || (windows && !amd64)
+//go:build (!darwin && !linux && !windows) || (darwin && !arm64) || (linux && !amd64 && !arm64) || (windows && !amd64)
 
 package fff
 
@@ -11,7 +11,7 @@ import (
 type nativeFinder struct{}
 
 func nativeOpen(context.Context, string, Options) (*nativeFinder, error) {
-	return nil, fmt.Errorf("FFF requires cgo on darwin/linux and supports windows/amd64")
+	return nil, fmt.Errorf("FFF supports darwin/arm64, linux/amd64, linux/arm64, and windows/amd64")
 }
 
 func (*nativeFinder) close() {}

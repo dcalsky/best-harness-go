@@ -447,7 +447,7 @@ err := h.RegisterBuiltinTools(harness.BuiltinConfig{
 defer h.Close()
 ```
 
-`grep` 和 `find` 使用索引搜索，支持 Windows x86-64、Linux x86-64/ARM64 和 macOS Apple Silicon。`find` 可以使用 glob（如 `*.go`）或模糊路径查询；`grep` 支持正则、`literal` 和上下文行。结果较多时，使用返回的 `cursor` 继续读取下一页。
+`grep` 和 `find` 使用索引搜索，支持 Windows x86-64、Linux x86-64/ARM64 和 macOS Apple Silicon。SDK 通过 purego 加载预编译的 FFF C FFI，不依赖 cgo 或本机 C 编译器。`find` 可以使用 glob（如 `*.go`）或模糊路径查询；`grep` 支持正则、`literal` 和上下文行。结果较多时，使用返回的 `cursor` 继续读取下一页。
 
 不再使用 Harness 时调用 `Close`。离线打包时，可通过 `FFFLibraryPath` 或 `BEST_HARNESS_FFF_LIBRARY` 指向随应用分发的库文件。
 

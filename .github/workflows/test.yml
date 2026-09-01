@@ -33,6 +33,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       BEST_HARNESS_FFF_INTEGRATION: "1"
+      CGO_ENABLED: "0"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7

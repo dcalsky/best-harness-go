@@ -1,4 +1,4 @@
-//go:build windows && amd64
+//go:build (darwin && arm64) || (linux && (amd64 || arm64)) || (windows && amd64)
 
 package fff
 
@@ -7,8 +7,8 @@ import (
 	"unsafe"
 )
 
-func TestWindowsCreateOptionsABI(t *testing.T) {
-	var options windowsCreateOptions
+func TestCreateOptionsABI(t *testing.T) {
+	var options createOptions
 	if size := unsafe.Sizeof(options); size != 88 {
 		t.Fatalf("size=%d", size)
 	}
