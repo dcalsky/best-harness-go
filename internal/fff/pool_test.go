@@ -60,3 +60,24 @@ func TestPoolCloseWaitsForActiveSearchAndRejectsReuse(t *testing.T) {
 		t.Fatalf("Find error=%v", err)
 	}
 }
+
+func TestFindPageOffsetUsesPageSize(t *testing.T) {
+	tests := []struct {
+		page, limit int
+		want        uint32
+	}{
+		{page: 0, limit: 7, want: 0},
+		{page: 1, limit: 7, want: 7},
+		{page: 5, limit: 30, want: 150},
+	}
+	for _, test := range tests {
+		got, err := findPageOffset(test.page, test.limit)
+		if err != nil || got != test.want {
+			t.Fatalf("page=%d limit=%d: offset=%d err=%v, want %d", test.page, test.limit, got, err, test.want)
+		}
+	}
+	maxInt := int(^uint(0) >> 1)
+	if _, err := findPageOffset(maxInt, 3); err == nil {
+		t.Fatal("expected native pagination overflow error")
+	}
+}

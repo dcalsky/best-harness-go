@@ -772,6 +772,24 @@ func (s *Session[S]) beforeTool(ctx context.Context, call ToolCall) (ToolCall, e
 	return call, nil
 }
 
+func (s *Session[S]) toolContext(ctx context.Context, call ToolCall) (context.Context, error) {
+	var err error
+	for _, hook := range s.harness.extensions.ToolCtx {
+		typed, tx := s.callbackContextForTool(ctx, s.activeRunID(), true, &call)
+		ctx, err = hook(ctx, typed, call)
+		if err != nil {
+			return ctx, err
+		}
+		if ctx == nil {
+			return nil, errors.New("tool context hook returned a nil context")
+		}
+		if err = s.finishCallback(tx, nil); err != nil {
+			return ctx, err
+		}
+	}
+	return ctx, nil
+}
+
 func (s *Session[S]) afterTool(ctx context.Context, call ToolCall, result Result) (Result, error) {
 	if typed, err := invocation.FromContext[S](ctx); err == nil {
 		for _, hook := range s.harness.extensions.AfterTool {
@@ -842,12 +860,12 @@ func (s *Session[S]) ensureAgent(ctx context.Context) error {
 		promptSnapshot.SystemPrompt = s.opts.SystemPrompt
 	}
 	system := resource.BuildSystemPrompt(resource.PromptOptions{Cwd: s.store.Header().Cwd, Tools: effectiveTools, Snapshot: promptSnapshot})
-	wrapped := hookedProvider[S]{session: s, base: p, hooks: s.harness.extensions.Request, contextHooks: s.harness.extensions.Context}
+	wrapped := hookedProvider[S]{session: s, base: p, hooks: s.harness.extensions.Request, requestContextHooks: s.harness.extensions.RequestCtx, contextHooks: s.harness.extensions.Context}
 	reasoning := s.store.Context().ThinkingLevel
 	if reasoning == "off" {
 		reasoning = ""
 	}
-	a := agent.New(agent.Options{Provider: wrapped, Model: s.model, Tools: s.harness.extensions.Tools, SystemPrompt: system, ExecutionMode: s.opts.ExecutionMode, QueueMode: s.opts.QueueMode, ActiveTools: s.activeTools, Generation: s.opts.Generation.Clone(), ReasoningEffort: reasoning, ToolBatches: s, BeforeTool: s.beforeTool, AfterTool: s.afterTool})
+	a := agent.New(agent.Options{Provider: wrapped, Model: s.model, Tools: s.harness.extensions.Tools, SystemPrompt: system, ExecutionMode: s.opts.ExecutionMode, QueueMode: s.opts.QueueMode, ActiveTools: s.activeTools, Generation: s.opts.Generation.Clone(), ReasoningEffort: reasoning, ToolBatches: s, BeforeTool: s.beforeTool, ToolContext: s.toolContext, AfterTool: s.afterTool})
 	a.ReplaceMessages(s.store.Context().Messages)
 	a.On(func(e AgentLifecycleEvent) { s.handleAgentEvent(context.Background(), e) })
 	s.agent = a
@@ -855,10 +873,11 @@ func (s *Session[S]) ensureAgent(ctx context.Context) error {
 }
 
 type hookedProvider[S any] struct {
-	session      *Session[S]
-	base         Provider
-	hooks        []RequestHook[S]
-	contextHooks []ContextHook[S]
+	session             *Session[S]
+	base                Provider
+	hooks               []RequestHook[S]
+	requestContextHooks []RequestContextHook[S]
+	contextHooks        []ContextHook[S]
 }
 
 func (p hookedProvider[S]) Stream(ctx context.Context, r Request) (Stream, error) {
@@ -872,6 +891,20 @@ func (p hookedProvider[S]) Stream(ctx context.Context, r Request) (Stream, error
 			return nil, err
 		}
 		r.Messages = messages
+	}
+	for _, h := range p.requestContextHooks {
+		typed, tx := p.session.callbackContext(ctx, p.session.activeRunID(), true)
+		var err error
+		ctx, err = h(ctx, typed, &r)
+		if err != nil {
+			return nil, err
+		}
+		if ctx == nil {
+			return nil, errors.New("request context hook returned a nil context")
+		}
+		if err := p.session.finishCallback(tx, nil); err != nil {
+			return nil, err
+		}
 	}
 	for _, h := range p.hooks {
 		typed, tx := p.session.callbackContext(ctx, p.session.activeRunID(), true)

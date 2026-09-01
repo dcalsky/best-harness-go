@@ -45,7 +45,9 @@ type (
 	BuiltinConfig             = builtin.Config
 	Extension[S any]          = extension.Extension[S]
 	ExtensionRegistry[S any]  = extension.Registry[S]
+	RequestContextHook[S any] = extension.RequestContextHook[S]
 	RequestHook[S any]        = extension.RequestHook[S]
+	ToolContextHook[S any]    = extension.ToolContextHook[S]
 	ContextHook[S any]        = extension.ContextHook[S]
 	Agent                     = agent.Agent
 	AgentRun                  = agent.Run

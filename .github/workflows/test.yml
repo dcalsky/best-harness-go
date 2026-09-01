@@ -40,3 +40,6 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go test -v -count=1 ./internal/fff ./internal/builtin
+      - name: Test FFF against example repository
+        working-directory: e2e
+        run: go test -v -count=1 -run '^TestFFFExampleRepo' .

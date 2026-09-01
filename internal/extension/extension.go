@@ -19,12 +19,20 @@ type Extension[S any] interface{ Register(*Registry[S]) error }
 type InputHook[S any] func(context.Context, invocation.Context[S], message.Message) (message.Message, error)
 type ContextHook[S any] func(context.Context, invocation.Context[S], []message.Message) ([]message.Message, error)
 type BeforeAgentHook[S any] func(context.Context, invocation.Context[S]) error
+
+// RequestContextHook enriches the context passed to the provider. It runs
+// before RequestHook and is intended for tracing and request-scoped values.
+type RequestContextHook[S any] func(context.Context, invocation.Context[S], *provider.Request) (context.Context, error)
 type RequestHook[S any] func(context.Context, invocation.Context[S], *provider.Request) error
 type ResponseHook[S any] func(context.Context, invocation.Context[S], message.Message) error
 type LifecycleHook[S any] func(context.Context, invocation.Context[S]) error
 type TreeHook[S any] func(context.Context, invocation.Context[S], string) error
 type UserBashHook[S any] func(context.Context, invocation.Context[S], string) (string, error)
 type BeforeToolCallHook[S any] func(context.Context, invocation.Context[S], tool.ToolCall) (tool.ToolCall, error)
+
+// ToolContextHook enriches the context passed to tool Execute and all
+// AfterToolCall hooks. It runs after argument preparation and BeforeTool hooks.
+type ToolContextHook[S any] func(context.Context, invocation.Context[S], tool.ToolCall) (context.Context, error)
 type AfterToolCallHook[S any] func(context.Context, invocation.Context[S], tool.ToolCall, tool.Result) (tool.Result, error)
 
 type Registry[S any] struct {
@@ -36,9 +44,11 @@ type Registry[S any] struct {
 	Input        []InputHook[S]
 	Context      []ContextHook[S]
 	BeforeAgent  []BeforeAgentHook[S]
+	RequestCtx   []RequestContextHook[S]
 	Request      []RequestHook[S]
 	Response     []ResponseHook[S]
 	BeforeTool   []BeforeToolCallHook[S]
+	ToolCtx      []ToolContextHook[S]
 	AfterTool    []AfterToolCallHook[S]
 	SessionStart []LifecycleHook[S]
 	Shutdown     []LifecycleHook[S]
@@ -94,10 +104,16 @@ func (r *Registry[S]) AddContextHook(h ContextHook[S])   { r.Context = append(r.
 func (r *Registry[S]) AddBeforeAgentHook(h BeforeAgentHook[S]) {
 	r.BeforeAgent = append(r.BeforeAgent, h)
 }
+func (r *Registry[S]) AddRequestContextHook(h RequestContextHook[S]) {
+	r.RequestCtx = append(r.RequestCtx, h)
+}
 func (r *Registry[S]) AddRequestHook(h RequestHook[S])   { r.Request = append(r.Request, h) }
 func (r *Registry[S]) AddResponseHook(h ResponseHook[S]) { r.Response = append(r.Response, h) }
 func (r *Registry[S]) AddBeforeToolCallHook(h BeforeToolCallHook[S]) {
 	r.BeforeTool = append(r.BeforeTool, h)
+}
+func (r *Registry[S]) AddToolContextHook(h ToolContextHook[S]) {
+	r.ToolCtx = append(r.ToolCtx, h)
 }
 func (r *Registry[S]) AddAfterToolCallHook(h AfterToolCallHook[S]) {
 	r.AfterTool = append(r.AfterTool, h)

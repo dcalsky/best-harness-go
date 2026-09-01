@@ -35,20 +35,27 @@ type Options struct {
 
 // FindOptions configures a file search.
 type FindOptions struct {
-	Pattern string
-	Limit   int
-	Page    int
+	Pattern        string
+	Limit          int
+	Page           int
+	UseQueryParser bool
 }
 
 // File is a path returned by FFF, relative to the indexed root.
 type File struct {
-	Path string
+	Path                 string
+	GitStatus            string
+	TotalFrecencyScore   int64
+	AccessFrecencyScore  int64
+	ModificationFrecency int64
+	Score                int
 }
 
 // FindResult is one page of file-search results.
 type FindResult struct {
 	Files        []File
 	TotalMatched int
+	TotalFiles   int
 	NextPage     int
 }
 
@@ -58,6 +65,7 @@ type GrepMode uint8
 const (
 	GrepPlain GrepMode = iota
 	GrepRegex
+	GrepFuzzy
 )
 
 // GrepOptions configures a content search.
@@ -68,6 +76,7 @@ type GrepOptions struct {
 	SmartCase     bool
 	Limit         int
 	FileOffset    int
+	MaxFileSize   uint64
 	TimeBudget    time.Duration
 	MaxPerFile    int
 	BeforeContext int
@@ -76,18 +85,24 @@ type GrepOptions struct {
 
 // Match is a content match returned by FFF, relative to the indexed root.
 type Match struct {
-	Path          string
-	Line          int
-	Text          string
-	ContextBefore []string
-	ContextAfter  []string
-	Definition    bool
+	Path                string
+	Line                int
+	Text                string
+	ContextBefore       []string
+	ContextAfter        []string
+	Definition          bool
+	GitStatus           string
+	TotalFrecencyScore  int64
+	AccessFrecencyScore int64
 }
 
 // GrepResult is one page of content-search results.
 type GrepResult struct {
 	Matches            []Match
+	TotalMatched       int
+	TotalFilesSearched int
 	TotalFiles         int
+	FilteredFileCount  int
 	NextFilePage       int
 	RegexFallbackError string
 }
@@ -223,6 +238,9 @@ func (p *Pool) Find(ctx context.Context, root string, opts FindOptions) (FindRes
 	if opts.Page < 0 {
 		return FindResult{}, errors.New("FFF find page must not be negative")
 	}
+	if _, err := findPageOffset(opts.Page, opts.Limit); err != nil {
+		return FindResult{}, err
+	}
 	entry, evicted, err := p.acquire(root)
 	for _, finder := range evicted {
 		finder.close()
@@ -236,17 +254,32 @@ func (p *Pool) Find(ctx context.Context, root string, opts FindOptions) (FindRes
 
 // Grep performs an indexed content search.
 func (p *Pool) Grep(ctx context.Context, root string, opts GrepOptions) (GrepResult, error) {
-	if opts.Limit <= 0 {
-		opts.Limit = 1000
-	}
 	if opts.FileOffset < 0 {
 		return GrepResult{}, errors.New("FFF grep file offset must not be negative")
+	}
+	if opts.Mode > GrepFuzzy {
+		return GrepResult{}, errors.New("FFF grep mode is invalid")
 	}
 	if opts.TimeBudget < 0 {
 		return GrepResult{}, errors.New("FFF grep time budget must not be negative")
 	}
 	if opts.BeforeContext < 0 || opts.AfterContext < 0 {
 		return GrepResult{}, errors.New("FFF grep context must not be negative")
+	}
+	values := []struct {
+		name  string
+		value int
+	}{
+		{"file offset", opts.FileOffset},
+		{"page limit", opts.Limit},
+		{"matches per file", opts.MaxPerFile},
+		{"before context lines", opts.BeforeContext},
+		{"after context lines", opts.AfterContext},
+	}
+	for _, candidate := range values {
+		if err := validateNativeUint32(candidate.name, candidate.value); err != nil {
+			return GrepResult{}, err
+		}
 	}
 	entry, evicted, err := p.acquire(root)
 	for _, finder := range evicted {
@@ -321,18 +354,31 @@ func (f *Finder) find(ctx context.Context, opts FindOptions) (FindResult, error)
 		return FindResult{}, err
 	}
 	var result FindResult
-	if hasGlob(opts.Pattern) {
+	if !opts.UseQueryParser && hasGlob(opts.Pattern) {
 		result, err = n.glob(opts.Pattern, opts.Page, opts.Limit)
 	} else {
 		result, err = n.search(opts.Pattern, opts.Page, opts.Limit)
 	}
-	if err == nil && result.TotalMatched > (opts.Page+1)*opts.Limit {
+	consumed := (uint64(opts.Page) + 1) * uint64(opts.Limit)
+	if err == nil && uint64(result.TotalMatched) > consumed {
 		result.NextPage = opts.Page + 1
 	}
 	if err == nil {
 		err = ctx.Err()
 	}
 	return result, err
+}
+
+func findPageOffset(page, limit int) (uint32, error) {
+	const maxNativeUint32 = uint64(1<<32 - 1)
+	if page < 0 || limit <= 0 {
+		return 0, errors.New("FFF find page and limit are outside the native pagination range")
+	}
+	page64, limit64 := uint64(page), uint64(limit)
+	if limit64 > maxNativeUint32 || page64 > maxNativeUint32/limit64 {
+		return 0, errors.New("FFF find page exceeds the native pagination range")
+	}
+	return uint32(page64 * limit64), nil
 }
 
 func (f *Finder) grep(ctx context.Context, opts GrepOptions) (GrepResult, error) {
@@ -348,6 +394,13 @@ func (f *Finder) grep(ctx context.Context, opts GrepOptions) (GrepResult, error)
 		err = ctx.Err()
 	}
 	return result, err
+}
+
+func validateNativeUint32(name string, value int) error {
+	if value < 0 || uint64(value) > uint64(^uint32(0)) {
+		return fmt.Errorf("FFF grep %s exceeds the native uint32 range", name)
+	}
+	return nil
 }
 
 func hasGlob(pattern string) bool {

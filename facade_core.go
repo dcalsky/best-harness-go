@@ -37,6 +37,7 @@ type (
 	PrepareNextTurn          = agent.PrepareNextTurn
 	ShouldStopAfterTurn      = agent.ShouldStopAfterTurn
 	BeforeAgentToolCall      = agent.BeforeToolCall
+	AgentToolContext         = agent.ToolContext
 	AfterAgentToolCall       = agent.AfterToolCall
 	InvocationActions        = invocation.Actions
 	InvocationConfig[S any]  = invocation.Config[S]
@@ -139,6 +140,7 @@ const (
 	FFFReleaseVersion = fff.ReleaseVersion
 	FFFGrepPlain      = fff.GrepPlain
 	FFFGrepRegex      = fff.GrepRegex
+	FFFGrepFuzzy      = fff.GrepFuzzy
 )
 
 func NewMutationQueue() *MutationQueue                               { return builtin.NewMutationQueue() }
@@ -198,12 +200,14 @@ type (
 	InputHook[S any]          = extension.InputHook[S]
 	ContextHook[S any]        = extension.ContextHook[S]
 	BeforeAgentHook[S any]    = extension.BeforeAgentHook[S]
+	RequestContextHook[S any] = extension.RequestContextHook[S]
 	RequestHook[S any]        = extension.RequestHook[S]
 	ResponseHook[S any]       = extension.ResponseHook[S]
 	LifecycleHook[S any]      = extension.LifecycleHook[S]
 	TreeHook[S any]           = extension.TreeHook[S]
 	UserBashHook[S any]       = extension.UserBashHook[S]
 	BeforeToolCallHook[S any] = extension.BeforeToolCallHook[S]
+	ToolContextHook[S any]    = extension.ToolContextHook[S]
 	AfterToolCallHook[S any]  = extension.AfterToolCallHook[S]
 )
 

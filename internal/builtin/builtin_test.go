@@ -23,7 +23,7 @@ func (fakeShell) Execute(_ context.Context, _ string, _ string, update func(stri
 type fakeSearch struct{}
 
 func (fakeSearch) Find(_ context.Context, _ string, _ fff.FindOptions) (fff.FindResult, error) {
-	return fff.FindResult{Files: []fff.File{{Path: "a.txt"}}, TotalMatched: 1}, nil
+	return fff.FindResult{Files: []fff.File{{Path: "a.txt", Score: 100}}, TotalMatched: 1}, nil
 }
 
 func (fakeSearch) Grep(_ context.Context, _ string, _ fff.GrepOptions) (fff.GrepResult, error) {
@@ -52,7 +52,7 @@ func TestWriteEditReadGrepFindLS(t *testing.T) {
 		t.Fatalf("read=%#v", read)
 	}
 	grep := execute(t, builtin.Grep(c), `{"pattern":"gamma","path":"."}`)
-	if !strings.Contains(grep.Content[0].Text, "a.txt:2") {
+	if !strings.Contains(grep.Content[0].Text, "a.txt\n 2: gamma") {
 		t.Fatalf("grep=%#v", grep)
 	}
 	find := execute(t, builtin.Find(c), `{"pattern":"*.txt","path":"."}`)

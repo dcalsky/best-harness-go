@@ -35,6 +35,73 @@ func TestFFFManagedFacade(t *testing.T) {
 	}
 }
 
+type contextMarker string
+
+type contextPropagationExtension struct{}
+
+func (contextPropagationExtension) Register(registry *harness.ExtensionRegistry[harness.NoState]) error {
+	registry.AddRequestContextHook(func(ctx context.Context, _ harness.Context[harness.NoState], _ *harness.Request) (context.Context, error) {
+		return context.WithValue(ctx, contextMarker("request"), true), nil
+	})
+	registry.AddToolContextHook(func(ctx context.Context, _ harness.Context[harness.NoState], _ harness.ToolCall) (context.Context, error) {
+		return context.WithValue(ctx, contextMarker("tool"), true), nil
+	})
+	return nil
+}
+
+func TestExtensionContextHooksReachProviderAndTool(t *testing.T) {
+	selected := harness.Model{Provider: "test", ID: "m"}
+	models := harness.NewModelRegistry()
+	if err := models.Register(selected); err != nil {
+		t.Fatal(err)
+	}
+	h, err := harness.NewStateless(harness.Options{Models: models})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.RegisterExtension(contextPropagationExtension{}); err != nil {
+		t.Fatal(err)
+	}
+	turn := 0
+	providerSawContext := false
+	provider := &harness.Faux{StreamFunc: func(ctx context.Context, _ harness.Request) (harness.Stream, error) {
+		providerSawContext = providerSawContext || ctx.Value(contextMarker("request")) == true
+		turn++
+		if turn == 1 {
+			return &harness.SliceStream{Events: []harness.StreamEvent{
+				{Type: harness.EventToolCallStart, Index: 0, ToolCallID: "call-1", ToolName: "echo", ArgumentsDelta: `{"text":"ok"}`},
+				{Type: harness.EventDone, StopReason: harness.StopToolUse},
+			}}, nil
+		}
+		return &harness.SliceStream{Events: []harness.StreamEvent{{Type: harness.EventDone, StopReason: harness.StopStop}}}, nil
+	}}
+	if err := h.RegisterProvider("test", provider); err != nil {
+		t.Fatal(err)
+	}
+	toolSawContext := false
+	if err := h.RegisterTool(harness.ToolSpec{Name: "echo"}, func(ctx context.Context, _ harness.Context[harness.NoState], _ facadeParams) (harness.ToolResult[facadeDetails], error) {
+		toolSawContext = ctx.Value(contextMarker("tool")) == true
+		return harness.ToolResult[facadeDetails]{Content: []harness.Content{harness.Text("ok")}}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	session, err := h.NewSession(context.Background(), harness.NewMemoryPersistence(), harness.SessionOptions{Model: &selected}, harness.NoState{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	run, err := session.Start(context.Background(), harness.Prompt{Steps: harness.Sequence{harness.UserText("go")}}, harness.StartOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !providerSawContext || !toolSawContext {
+		t.Fatalf("context propagation: provider=%v tool=%v", providerSawContext, toolSawContext)
+	}
+}
+
 type facadeStructValidator struct {
 	validate func(any) error
 }

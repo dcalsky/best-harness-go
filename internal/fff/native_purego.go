@@ -60,23 +60,35 @@ type puregoBridge struct {
 	resultHandle  func(uintptr) uintptr
 
 	searchItem  func(uintptr, uint32) uintptr
+	searchScore func(uintptr, uint32) unsafe.Pointer
 	searchCount func(uintptr) uint32
 	searchTotal func(uintptr) uint32
+	searchFiles func(uintptr) uint32
 	filePath    func(uintptr) string
+	fileGit     func(uintptr) string
+	fileTotal   func(uintptr) int64
+	fileAccess  func(uintptr) int64
+	fileModify  func(uintptr) int64
 
-	grepMatch       func(uintptr, uint32) uintptr
-	grepCount       func(uintptr) uint32
-	grepTotalFiles  func(uintptr) uint32
-	grepNextOffset  func(uintptr) uint32
-	grepPath        func(uintptr) string
-	grepText        func(uintptr) string
-	grepLine        func(uintptr) uint64
-	grepDefinition  func(uintptr) bool
-	grepFallback    func(uintptr) string
-	grepBeforeCount func(uintptr) uint32
-	grepAfterCount  func(uintptr) uint32
-	grepBefore      func(uintptr, uint32) string
-	grepAfter       func(uintptr, uint32) string
+	grepMatch         func(uintptr, uint32) uintptr
+	grepCount         func(uintptr) uint32
+	grepTotalMatched  func(uintptr) uint32
+	grepFilesSearched func(uintptr) uint32
+	grepTotalFiles    func(uintptr) uint32
+	grepFilteredFiles func(uintptr) uint32
+	grepNextOffset    func(uintptr) uint32
+	grepPath          func(uintptr) string
+	grepText          func(uintptr) string
+	grepLine          func(uintptr) uint64
+	grepDefinition    func(uintptr) bool
+	grepGit           func(uintptr) string
+	grepTotal         func(uintptr) int64
+	grepAccess        func(uintptr) int64
+	grepFallback      func(uintptr) string
+	grepBeforeCount   func(uintptr) uint32
+	grepAfterCount    func(uintptr) uint32
+	grepBefore        func(uintptr, uint32) string
+	grepAfter         func(uintptr, uint32) string
 }
 
 var puregoBridgeRegistry = struct {
@@ -160,17 +172,29 @@ func puregoBridgeFor(libraryPath string) (*puregoBridge, error) {
 		{"fff_result_get_error", &bridge.resultError},
 		{"fff_result_get_handle", &bridge.resultHandle},
 		{"fff_search_result_get_item", &bridge.searchItem},
+		{"fff_search_result_get_score", &bridge.searchScore},
 		{"fff_search_result_get_count", &bridge.searchCount},
 		{"fff_search_result_get_total_matched", &bridge.searchTotal},
+		{"fff_search_result_get_total_files", &bridge.searchFiles},
 		{"fff_file_item_get_relative_path", &bridge.filePath},
+		{"fff_file_item_get_git_status", &bridge.fileGit},
+		{"fff_file_item_get_total_frecency_score", &bridge.fileTotal},
+		{"fff_file_item_get_access_frecency_score", &bridge.fileAccess},
+		{"fff_file_item_get_modification_frecency_score", &bridge.fileModify},
 		{"fff_grep_result_get_match", &bridge.grepMatch},
 		{"fff_grep_result_get_count", &bridge.grepCount},
-		{"fff_grep_result_get_total_files_searched", &bridge.grepTotalFiles},
+		{"fff_grep_result_get_total_matched", &bridge.grepTotalMatched},
+		{"fff_grep_result_get_total_files_searched", &bridge.grepFilesSearched},
+		{"fff_grep_result_get_total_files", &bridge.grepTotalFiles},
+		{"fff_grep_result_get_filtered_file_count", &bridge.grepFilteredFiles},
 		{"fff_grep_result_get_next_file_offset", &bridge.grepNextOffset},
 		{"fff_grep_match_get_relative_path", &bridge.grepPath},
 		{"fff_grep_match_get_line_content", &bridge.grepText},
 		{"fff_grep_match_get_line_number", &bridge.grepLine},
 		{"fff_grep_match_get_is_definition", &bridge.grepDefinition},
+		{"fff_grep_match_get_git_status", &bridge.grepGit},
+		{"fff_grep_match_get_total_frecency_score", &bridge.grepTotal},
+		{"fff_grep_match_get_access_frecency_score", &bridge.grepAccess},
 		{"fff_grep_match_get_context_before_count", &bridge.grepBeforeCount},
 		{"fff_grep_match_get_context_after_count", &bridge.grepAfterCount},
 		{"fff_grep_match_get_context_before", &bridge.grepBefore},
@@ -222,12 +246,20 @@ func (n *nativeFinder) waitForScan(timeout time.Duration) error {
 }
 
 func (n *nativeFinder) search(query string, page, limit int) (FindResult, error) {
-	result := n.bridge.search(n.handle, query, 0, 0, uint32(page), uint32(limit), 0, 0)
+	offset, err := findPageOffset(page, limit)
+	if err != nil {
+		return FindResult{}, err
+	}
+	result := n.bridge.search(n.handle, query, 0, 0, offset, uint32(limit), 0, 0)
 	return n.collectFind(result)
 }
 
 func (n *nativeFinder) glob(query string, page, limit int) (FindResult, error) {
-	result := n.bridge.glob(n.handle, query, 0, 0, uint32(page), uint32(limit))
+	offset, err := findPageOffset(page, limit)
+	if err != nil {
+		return FindResult{}, err
+	}
+	result := n.bridge.glob(n.handle, query, 0, 0, offset, uint32(limit))
 	return n.collectFind(result)
 }
 
@@ -241,25 +273,39 @@ func (n *nativeFinder) collectFind(result uintptr) (FindResult, error) {
 	files := make([]File, 0, int(count))
 	for index := uint32(0); index < count; index++ {
 		item := n.bridge.searchItem(payload, index)
+		if item == 0 {
+			continue
+		}
 		if path := n.bridge.filePath(item); path != "" {
-			files = append(files, File{Path: path})
+			score := 0
+			if scorePointer := n.bridge.searchScore(payload, index); scorePointer != nil {
+				// FffScore.total is the first int32 field in the public C ABI.
+				score = int(*(*int32)(scorePointer))
+			}
+			files = append(files, File{
+				Path:                 path,
+				GitStatus:            n.bridge.fileGit(item),
+				TotalFrecencyScore:   n.bridge.fileTotal(item),
+				AccessFrecencyScore:  n.bridge.fileAccess(item),
+				ModificationFrecency: n.bridge.fileModify(item),
+				Score:                score,
+			})
 		}
 	}
-	return FindResult{Files: files, TotalMatched: int(n.bridge.searchTotal(payload))}, nil
+	return FindResult{
+		Files: files, TotalMatched: int(n.bridge.searchTotal(payload)),
+		TotalFiles: int(n.bridge.searchFiles(payload)),
+	}, nil
 }
 
 func (n *nativeFinder) grep(opts GrepOptions) (GrepResult, error) {
 	query := strings.TrimSpace(strings.Join([]string{opts.Constraints, opts.Pattern}, " "))
-	maxPerFile := opts.MaxPerFile
-	if maxPerFile <= 0 {
-		maxPerFile = 200
-	}
 	result := n.bridge.grep(
 		n.handle,
 		query,
 		uint8(opts.Mode),
-		10*1024*1024,
-		uint32(maxPerFile),
+		opts.MaxFileSize,
+		uint32(opts.MaxPerFile),
 		opts.SmartCase,
 		uint32(opts.FileOffset),
 		uint32(opts.Limit),
@@ -279,35 +325,39 @@ func (n *nativeFinder) grep(opts GrepOptions) (GrepResult, error) {
 		match := n.bridge.grepMatch(payload, index)
 		path := n.bridge.grepPath(match)
 		text := n.bridge.grepText(match)
-		if path == "" || text == "" {
+		if path == "" {
 			continue
 		}
 		beforeCount := n.bridge.grepBeforeCount(match)
 		before := make([]string, 0, int(beforeCount))
 		for contextIndex := uint32(0); contextIndex < beforeCount; contextIndex++ {
-			if line := n.bridge.grepBefore(match, contextIndex); line != "" {
-				before = append(before, line)
-			}
+			// Empty lines are meaningful context and must retain their position so
+			// the builtin formatter can derive the correct source line numbers.
+			before = append(before, n.bridge.grepBefore(match, contextIndex))
 		}
 		afterCount := n.bridge.grepAfterCount(match)
 		after := make([]string, 0, int(afterCount))
 		for contextIndex := uint32(0); contextIndex < afterCount; contextIndex++ {
-			if line := n.bridge.grepAfter(match, contextIndex); line != "" {
-				after = append(after, line)
-			}
+			after = append(after, n.bridge.grepAfter(match, contextIndex))
 		}
 		matches = append(matches, Match{
-			Path:          path,
-			Line:          int(n.bridge.grepLine(match)),
-			Text:          text,
-			ContextBefore: before,
-			ContextAfter:  after,
-			Definition:    n.bridge.grepDefinition(match),
+			Path:                path,
+			Line:                int(n.bridge.grepLine(match)),
+			Text:                text,
+			ContextBefore:       before,
+			ContextAfter:        after,
+			Definition:          n.bridge.grepDefinition(match),
+			GitStatus:           n.bridge.grepGit(match),
+			TotalFrecencyScore:  n.bridge.grepTotal(match),
+			AccessFrecencyScore: n.bridge.grepAccess(match),
 		})
 	}
 	return GrepResult{
 		Matches:            matches,
+		TotalMatched:       int(n.bridge.grepTotalMatched(payload)),
+		TotalFilesSearched: int(n.bridge.grepFilesSearched(payload)),
 		TotalFiles:         int(n.bridge.grepTotalFiles(payload)),
+		FilteredFileCount:  int(n.bridge.grepFilteredFiles(payload)),
 		NextFilePage:       int(n.bridge.grepNextOffset(payload)),
 		RegexFallbackError: n.bridge.grepFallback(payload),
 	}, nil

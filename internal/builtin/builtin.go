@@ -4,7 +4,6 @@ package builtin
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -370,17 +369,18 @@ func Bash(c Config) tool.Tool[BashParams, BashDetails] {
 }
 
 type GrepParams struct {
-	Pattern    string `json:"pattern"`
-	Path       string `json:"path,omitempty"`
-	Glob       string `json:"glob,omitempty"`
-	IgnoreCase bool   `json:"ignoreCase,omitempty"`
-	Literal    bool   `json:"literal,omitempty"`
-	Context    int    `json:"context,omitempty"`
-	Cursor     string `json:"cursor,omitempty"`
-	MaxResults int    `json:"maxResults,omitempty"`
+	Pattern       string   `json:"pattern"`
+	Path          string   `json:"path,omitempty"`
+	Exclude       []string `json:"exclude,omitempty"`
+	CaseSensitive bool     `json:"caseSensitive,omitempty"`
+	Context       int      `json:"context,omitempty"`
+	Limit         int      `json:"limit,omitempty"`
+	Cursor        string   `json:"cursor,omitempty"`
 }
 type GrepDetails struct {
 	Matches, Files     int
+	TotalMatched       int    `json:"totalMatched"`
+	TotalFiles         int    `json:"totalFiles"`
 	Cursor             string `json:"cursor,omitempty"`
 	RegexFallbackError string `json:"regexFallbackError,omitempty"`
 	Truncation
@@ -395,37 +395,37 @@ const (
 	defaultFindPageSize = 30
 )
 
-func searchCursor(kind string, position int, fingerprint string) string {
-	payload := fmt.Sprintf("%s:%d:%s", kind, position, fingerprint)
-	return base64.RawURLEncoding.EncodeToString([]byte(payload))
+type fffCursorStore[T any] struct {
+	mu     sync.Mutex
+	prefix string
+	next   uint64
+	values map[string]T
+	order  []string
 }
 
-func parseSearchCursor(value, kind, fingerprint string) (int, error) {
-	if value == "" {
-		return 0, nil
-	}
-	b, err := base64.RawURLEncoding.DecodeString(value)
-	if err != nil {
-		return 0, errors.New("invalid FFF cursor")
-	}
-	parts := strings.Split(string(b), ":")
-	if len(parts) != 3 || parts[0] != kind || parts[2] != fingerprint {
-		return 0, errors.New("FFF cursor does not match this search")
-	}
-	position, err := strconv.Atoi(parts[1])
-	if err != nil || position < 0 {
-		return 0, errors.New("invalid FFF cursor position")
-	}
-	return position, nil
+func newFFFCursorStore[T any](prefix string) *fffCursorStore[T] {
+	return &fffCursorStore[T]{prefix: prefix, values: make(map[string]T)}
 }
 
-func cursorFingerprint(values ...string) string {
-	hash := sha256.New()
-	for _, value := range values {
-		_, _ = hash.Write([]byte(value))
-		_, _ = hash.Write([]byte{0})
+func (s *fffCursorStore[T]) put(value T) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.next++
+	id := fmt.Sprintf("%s%d", s.prefix, s.next)
+	s.values[id] = value
+	s.order = append(s.order, id)
+	if len(s.order) > 200 {
+		delete(s.values, s.order[0])
+		s.order = s.order[1:]
 	}
-	return fmt.Sprintf("%x", hash.Sum(nil)[:8])
+	return id
+}
+
+func (s *fffCursorStore[T]) get(id string) (T, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, ok := s.values[id]
+	return value, ok
 }
 
 func grepBudget(ctx context.Context) time.Duration {
@@ -442,43 +442,274 @@ func grepBudget(ctx context.Context) time.Duration {
 	return budget
 }
 
+const maxGrepLineLength = 500
+
+const (
+	hotFrecency        = 25
+	warmFrecency       = 20
+	findWeakSampleSize = 5
+)
+
+var (
+	wildcardOnlyPattern  = regexp.MustCompile(`^(?:[.^$]*(?:[.][*+?]|\*|\+)[.^$]*|[.^$\s]*|\.\*\??|\.\*[+?]?|\.\+\??|\.|\*|\?)$`)
+	recursiveDirPattern  = regexp.MustCompile(`^(.*)/\*\*(?:/\*)?$`)
+	fileExtensionPattern = regexp.MustCompile(`\.[A-Za-z][A-Za-z0-9]{0,9}$`)
+)
+
+func normalizeFFFPathConstraint(value, cwd string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || trimmed == "." || trimmed == "./" {
+		return "", nil
+	}
+	if filepath.IsAbs(trimmed) {
+		relative, err := filepath.Rel(cwd, trimmed)
+		if err != nil {
+			return "", err
+		}
+		if relative == "." {
+			return "", nil
+		}
+		if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+			return "", fmt.Errorf("path constraint must be relative to the workspace: %s", value)
+		}
+		trimmed = relative
+	}
+	trimmed = filepath.ToSlash(trimmed)
+	trimmed = strings.TrimPrefix(trimmed, "./")
+	if trimmed == "**" || trimmed == "**/" || trimmed == "**/*" {
+		return "", nil
+	}
+	if match := recursiveDirPattern.FindStringSubmatch(trimmed); len(match) == 2 && match[1] != "" && !strings.ContainsAny(match[1], "*?[{") {
+		return match[1] + "/", nil
+	}
+	if strings.HasPrefix(trimmed, "/") || strings.HasSuffix(trimmed, "/") || strings.ContainsAny(trimmed, "*?[{") {
+		return trimmed, nil
+	}
+	last := trimmed
+	if index := strings.LastIndexByte(last, '/'); index >= 0 {
+		last = last[index+1:]
+	}
+	if fileExtensionPattern.MatchString(last) {
+		return trimmed, nil
+	}
+	return trimmed + "/", nil
+}
+
+func fffSearchScope(c Config, requested string) (root, constraint string, err error) {
+	root = c.Cwd
+	trimmed := strings.TrimSpace(requested)
+	if trimmed == "" {
+		return root, "", nil
+	}
+	if trimmed == "~" || strings.HasPrefix(trimmed, "~/") || strings.HasPrefix(trimmed, `~\`) {
+		home, homeErr := os.UserHomeDir()
+		if homeErr != nil {
+			return "", "", homeErr
+		}
+		trimmed = filepath.Join(home, strings.TrimLeft(trimmed[1:], `/\`))
+	}
+	absolute := trimmed
+	if !filepath.IsAbs(absolute) {
+		absolute = filepath.Join(c.Cwd, trimmed)
+	}
+	relative, relErr := filepath.Rel(c.Cwd, absolute)
+	outside := relErr == nil && (relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)))
+	if outside {
+		return resolveFFFAuxScope(c.FileSystem, absolute)
+	}
+	constraint, err = normalizeFFFPathConstraint(trimmed, c.Cwd)
+	return root, constraint, err
+}
+
+func resolveFFFAuxScope(fileSystem FileSystem, absolute string) (root, constraint string, err error) {
+	candidate := filepath.Clean(absolute)
+	var suffix []string
+	for {
+		info, statErr := fileSystem.Stat(candidate)
+		if statErr == nil {
+			if !info.IsDir() {
+				suffix = append([]string{filepath.Base(candidate)}, suffix...)
+				candidate = filepath.Dir(candidate)
+			}
+			constraint, err = normalizeFFFPathConstraint(filepath.ToSlash(filepath.Join(suffix...)), candidate)
+			return candidate, constraint, err
+		}
+		parent := filepath.Dir(candidate)
+		if parent == candidate {
+			return "", "", fmt.Errorf("cannot resolve an existing directory for path constraint %q", absolute)
+		}
+		suffix = append([]string{filepath.Base(candidate)}, suffix...)
+		candidate = parent
+	}
+}
+
+func fffConstraints(pathConstraint string, excludes []string, root string) (string, error) {
+	parts := make([]string, 0, 1+len(excludes))
+	if pathConstraint != "" {
+		parts = append(parts, pathConstraint)
+	}
+	for _, group := range excludes {
+		for _, raw := range strings.FieldsFunc(group, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' || r == '\n' }) {
+			raw = strings.TrimPrefix(raw, "!")
+			normalized, err := normalizeFFFPathConstraint(raw, root)
+			if err != nil {
+				return "", err
+			}
+			if normalized != "" {
+				parts = append(parts, "!"+normalized)
+			}
+		}
+	}
+	return strings.Join(parts, " "), nil
+}
+
+func truncateFFFLine(line string) string {
+	trimmed := strings.TrimSpace(line)
+	runes := []rune(trimmed)
+	if len(runes) <= maxGrepLineLength {
+		return trimmed
+	}
+	return string(runes[:maxGrepLineLength]) + "..."
+}
+
+func fffFileAnnotation(gitStatus string, totalFrecency, accessFrecency int64) string {
+	if gitStatus != "" && gitStatus != "clean" && gitStatus != "unknown" {
+		return fmt.Sprintf("  [%s in git]", gitStatus)
+	}
+	frecency := totalFrecency
+	if frecency == 0 {
+		frecency = accessFrecency
+	}
+	if frecency >= hotFrecency {
+		return "  [VERY often touched file]"
+	}
+	if frecency >= warmFrecency {
+		return "  [often touched file]"
+	}
+	return ""
+}
+
+func formatFFFGrep(matches []fff.Match) string {
+	if len(matches) == 0 {
+		return "No matches found"
+	}
+	var out strings.Builder
+	currentFile := ""
+	for _, match := range matches {
+		if match.Path != currentFile {
+			if out.Len() > 0 {
+				out.WriteByte('\n')
+			}
+			currentFile = match.Path
+			fmt.Fprintln(&out, currentFile+fffFileAnnotation(match.GitStatus, match.TotalFrecencyScore, match.AccessFrecencyScore))
+		}
+		for index, line := range match.ContextBefore {
+			lineNumber := match.Line - len(match.ContextBefore) + index
+			fmt.Fprintf(&out, " %d- %s\n", lineNumber, truncateFFFLine(line))
+		}
+		fmt.Fprintf(&out, " %d: %s\n", match.Line, truncateFFFLine(match.Text))
+		for index, line := range match.ContextAfter {
+			fmt.Fprintf(&out, " %d- %s\n", match.Line+index+1, truncateFFFLine(line))
+		}
+	}
+	return strings.TrimSuffix(out.String(), "\n")
+}
+
+func weakFindScoreThreshold(pattern string) int {
+	perfect := len(pattern) * 12
+	return perfect / 2
+}
+
+func formatFFFFind(result fff.FindResult, limit int, pattern string) (output string, weak bool, shown int) {
+	if len(result.Files) == 0 {
+		return "No files found matching pattern", false, 0
+	}
+	weak = result.Files[0].Score < weakFindScoreThreshold(pattern)
+	effective := limit
+	if weak && effective > findWeakSampleSize {
+		effective = findWeakSampleSize
+	}
+	if effective > len(result.Files) {
+		effective = len(result.Files)
+	}
+	lines := make([]string, 0, effective)
+	for _, file := range result.Files[:effective] {
+		lines = append(lines, file.Path+fffFileAnnotation(file.GitStatus, file.TotalFrecencyScore, file.AccessFrecencyScore))
+	}
+	return strings.Join(lines, "\n"), weak, effective
+}
+
+func truncateFFFOutput(ctx context.Context, c Config, name, body string, notices []string) (string, Truncation) {
+	suffix := ""
+	if len(notices) > 0 {
+		suffix = "\n\n[" + strings.Join(notices, ". ") + "]"
+	}
+	full := body + suffix
+	details := Truncation{OriginalBytes: len(full)}
+	if len(full) <= c.MaxOutputBytes {
+		return full, details
+	}
+	details.Truncated = true
+	if c.OutputStore != nil {
+		details.StoredAt, _ = c.OutputStore.Save(ctx, name, []byte(full))
+	}
+	if len(suffix) >= c.MaxOutputBytes {
+		// A continuation cursor must remain intact even with an unusually small
+		// caller-provided output budget.
+		return suffix, details
+	}
+	marker := "\n... output truncated ..."
+	budget := c.MaxOutputBytes - len(suffix)
+	if budget <= len(marker) {
+		return marker[:budget] + suffix, details
+	}
+	bodyBytes := []byte(body)
+	cut := budget - len(marker)
+	for cut > 0 && cut < len(bodyBytes) && bodyBytes[cut]&0xc0 == 0x80 {
+		cut--
+	}
+	return string(bodyBytes[:cut]) + marker + suffix, details
+}
+
 func Grep(c Config) tool.Tool[GrepParams, GrepDetails] {
 	c = c.defaults()
 	engine, engineErr := searcher(c)
-	return tool.Tool[GrepParams, GrepDetails]{Name: "grep", Description: "Search indexed text files with FFF.", ExecutionMode: tool.Parallel, Execute: func(ctx context.Context, _ tool.ToolCall, p GrepParams, _ tool.Update[GrepDetails]) (tool.ToolResult[GrepDetails], error) {
+	cursors := newFFFCursorStore[int]("fff_c")
+	return tool.Tool[GrepParams, GrepDetails]{Name: "grep", Description: "Grep file contents with FFF. Smart-case, auto-detects regex versus literal, and preserves native frecency order.", ExecutionMode: tool.Parallel, Execute: func(ctx context.Context, _ tool.ToolCall, p GrepParams, _ tool.Update[GrepDetails]) (tool.ToolResult[GrepDetails], error) {
 		if engineErr != nil {
 			return tool.ToolResult[GrepDetails]{}, engineErr
 		}
 		if err := ctx.Err(); err != nil {
 			return tool.ToolResult[GrepDetails]{}, err
 		}
-		rawPattern := p.Pattern
-		pattern := p.Pattern
-		root := resolve(c, p.Path)
-		if p.Path == "" {
-			root = c.Cwd
+		root, pathConstraint, err := fffSearchScope(c, p.Path)
+		if err != nil {
+			return tool.ToolResult[GrepDetails]{}, err
 		}
-		limit := p.MaxResults
-		if limit <= 0 {
+		constraints, err := fffConstraints(pathConstraint, p.Exclude, root)
+		if err != nil {
+			return tool.ToolResult[GrepDetails]{}, err
+		}
+		limit := p.Limit
+		if limit == 0 {
 			limit = defaultGrepPageSize
+		} else if limit < 0 {
+			limit = 1
 		}
 		if limit > maxGrepPageSize {
 			limit = maxGrepPageSize
 		}
-		mode := fff.GrepRegex
-		if p.Literal && !p.IgnoreCase {
-			mode = fff.GrepPlain
-		}
-		if p.IgnoreCase {
-			if p.Literal {
-				pattern = regexp.QuoteMeta(pattern)
+		rawPattern := p.Pattern
+		hasRegexSyntax := regexp.QuoteMeta(rawPattern) != rawPattern
+		mode := fff.GrepPlain
+		if hasRegexSyntax {
+			if _, compileErr := regexp.Compile(rawPattern); compileErr == nil {
+				mode = fff.GrepRegex
 			}
-			pattern = "(?i)" + pattern
 		}
-		if mode == fff.GrepRegex {
-			if _, err := regexp.Compile(pattern); err != nil {
-				return tool.ToolResult[GrepDetails]{}, err
-			}
+		if hasRegexSyntax && wildcardOnlyPattern.MatchString(strings.TrimSpace(rawPattern)) {
+			messageText := fmt.Sprintf("Pattern '%s' matches everything — grep needs a concrete substring or identifier. Example: `pattern: 'MyClass'` or `pattern: 'export function'`.", rawPattern)
+			return tool.ToolResult[GrepDetails]{Content: []message.Content{message.Text(messageText)}, Details: GrepDetails{}}, nil
 		}
 		contextLines := p.Context
 		if contextLines < 0 {
@@ -486,18 +717,20 @@ func Grep(c Config) tool.Tool[GrepParams, GrepDetails] {
 		} else if contextLines > maxGrepContext {
 			contextLines = maxGrepContext
 		}
-		fingerprint := cursorFingerprint(root, rawPattern, p.Glob, strconv.FormatBool(p.IgnoreCase), strconv.FormatBool(p.Literal), strconv.Itoa(contextLines), strconv.Itoa(limit))
-		fileOffset, err := parseSearchCursor(p.Cursor, "g", fingerprint)
-		if err != nil {
-			return tool.ToolResult[GrepDetails]{}, err
+		smartCase := !p.CaseSensitive
+		fileOffset := 0
+		if p.Cursor != "" {
+			var ok bool
+			fileOffset, ok = cursors.get(p.Cursor)
+			if !ok {
+				return tool.ToolResult[GrepDetails]{}, errors.New("invalid FFF grep cursor")
+			}
 		}
 		result, err := engine.Grep(ctx, root, fff.GrepOptions{
-			Pattern:     pattern,
-			Constraints: p.Glob,
-			Mode:        mode,
-			// The existing tool was case-sensitive by default. Preserve that
-			// contract rather than inheriting FFF's smart-case default.
-			SmartCase:     false,
+			Pattern:       rawPattern,
+			Constraints:   constraints,
+			Mode:          mode,
+			SmartCase:     smartCase,
 			Limit:         limit,
 			FileOffset:    fileOffset,
 			TimeBudget:    grepBudget(ctx),
@@ -508,79 +741,132 @@ func Grep(c Config) tool.Tool[GrepParams, GrepDetails] {
 		if err != nil {
 			return tool.ToolResult[GrepDetails]{}, err
 		}
-		var out strings.Builder
+		fuzzyNotice := ""
+		if len(result.Matches) == 0 && result.NextFilePage == 0 && p.Cursor == "" && mode != fff.GrepRegex {
+			fuzzyConstraints := constraints
+			lastSegment := filepath.Base(filepath.ToSlash(p.Path))
+			if fileExtensionPattern.MatchString(lastSegment) {
+				fuzzyConstraints = ""
+			}
+			fuzzy, fuzzyErr := engine.Grep(ctx, root, fff.GrepOptions{
+				Pattern: rawPattern, Constraints: fuzzyConstraints, Mode: fff.GrepFuzzy,
+				SmartCase: smartCase, Limit: limit, TimeBudget: grepBudget(ctx),
+				MaxPerFile: maxGrepPerFile,
+			})
+			if fuzzyErr == nil && len(fuzzy.Matches) > 0 {
+				result = fuzzy
+				fuzzyNotice = "0 exact matches. Maybe you meant this?"
+			}
+		}
 		files := make(map[string]struct{})
 		for _, match := range result.Matches {
 			files[match.Path] = struct{}{}
-			for index, line := range match.ContextBefore {
-				lineNumber := match.Line - len(match.ContextBefore) + index
-				fmt.Fprintf(&out, "%s:%d-:%s\n", match.Path, lineNumber, line)
-			}
-			fmt.Fprintf(&out, "%s:%d:%s\n", match.Path, match.Line, match.Text)
-			for index, line := range match.ContextAfter {
-				fmt.Fprintf(&out, "%s:%d-:%s\n", match.Path, match.Line+index+1, line)
-			}
 		}
-		details := GrepDetails{Matches: len(result.Matches), Files: len(files), RegexFallbackError: result.RegexFallbackError}
-		if result.NextFilePage > 0 {
-			details.Cursor = searchCursor("g", result.NextFilePage, fingerprint)
-			fmt.Fprintf(&out, "\nContinue with cursor=\"%s\"", details.Cursor)
+		details := GrepDetails{
+			Matches: len(result.Matches), Files: len(files), TotalMatched: result.TotalMatched,
+			TotalFiles: result.TotalFiles, RegexFallbackError: result.RegexFallbackError,
+		}
+		output := formatFFFGrep(result.Matches)
+		notices := make([]string, 0, 3)
+		if fuzzyNotice != "" {
+			output = "[" + fuzzyNotice + "]\n" + output
 		}
 		if result.RegexFallbackError != "" {
-			fmt.Fprintf(&out, "\nInvalid regex: %s; FFF used literal matching", result.RegexFallbackError)
+			notices = append(notices, "Invalid regex: "+result.RegexFallbackError+", used literal match")
 		}
-		text, tr := truncate(ctx, c, "grep-output", []byte(strings.TrimSuffix(out.String(), "\n")))
+		if result.NextFilePage > 0 {
+			details.Cursor = cursors.put(result.NextFilePage)
+			notices = append(notices, fmt.Sprintf("Continue with cursor=\"%s\"", details.Cursor))
+		}
+		text, tr := truncateFFFOutput(ctx, c, "grep-output", output, notices)
 		details.Truncation = tr
 		return tool.ToolResult[GrepDetails]{Content: []message.Content{message.Text(text)}, Details: details}, nil
 	}}
 }
 
 type FindParams struct {
-	Pattern    string `json:"pattern"`
-	Path       string `json:"path,omitempty"`
-	Cursor     string `json:"cursor,omitempty"`
-	MaxResults int    `json:"maxResults,omitempty"`
+	Pattern string   `json:"pattern"`
+	Path    string   `json:"path,omitempty"`
+	Exclude []string `json:"exclude,omitempty"`
+	Limit   int      `json:"limit,omitempty"`
+	Cursor  string   `json:"cursor,omitempty"`
 }
 type FindDetails struct {
-	Results int
-	Cursor  string `json:"cursor,omitempty"`
+	Results      int
+	TotalMatched int    `json:"totalMatched"`
+	TotalFiles   int    `json:"totalFiles"`
+	PageIndex    int    `json:"pageIndex"`
+	HasMore      bool   `json:"hasMore"`
+	Cursor       string `json:"cursor,omitempty"`
 	Truncation
+}
+
+type findCursor struct {
+	Root     string
+	Query    string
+	Pattern  string
+	PageSize int
+	NextPage int
 }
 
 func Find(c Config) tool.Tool[FindParams, FindDetails] {
 	c = c.defaults()
 	engine, engineErr := searcher(c)
-	return tool.Tool[FindParams, FindDetails]{Name: "find", Description: "Find files with FFF's indexed fuzzy and glob search.", ExecutionMode: tool.Parallel, Execute: func(ctx context.Context, _ tool.ToolCall, p FindParams, _ tool.Update[FindDetails]) (tool.ToolResult[FindDetails], error) {
+	cursors := newFFFCursorStore[findCursor]("")
+	return tool.Tool[FindParams, FindDetails]{Name: "find", Description: "Fuzzy path and glob search with FFF. Matches the whole repository-relative path and preserves native frecency order.", ExecutionMode: tool.Parallel, Execute: func(ctx context.Context, _ tool.ToolCall, p FindParams, _ tool.Update[FindDetails]) (tool.ToolResult[FindDetails], error) {
 		if engineErr != nil {
 			return tool.ToolResult[FindDetails]{}, engineErr
 		}
-		root := resolve(c, p.Path)
-		if p.Path == "" {
-			root = c.Cwd
+		root, query, pattern, limit, page := "", "", p.Pattern, p.Limit, 0
+		if p.Cursor != "" {
+			resumed, ok := cursors.get(p.Cursor)
+			if !ok {
+				return tool.ToolResult[FindDetails]{}, errors.New("invalid FFF find cursor")
+			}
+			root, query, pattern, limit, page = resumed.Root, resumed.Query, resumed.Pattern, resumed.PageSize, resumed.NextPage
+		} else {
+			var pathConstraint string
+			var err error
+			root, pathConstraint, err = fffSearchScope(c, p.Path)
+			if err != nil {
+				return tool.ToolResult[FindDetails]{}, err
+			}
+			constraints, constraintErr := fffConstraints(pathConstraint, p.Exclude, root)
+			if constraintErr != nil {
+				return tool.ToolResult[FindDetails]{}, constraintErr
+			}
+			if limit == 0 {
+				limit = defaultFindPageSize
+			} else if limit < 0 {
+				limit = 1
+			}
+			query = strings.TrimSpace(strings.Join([]string{constraints, pattern}, " "))
 		}
-		limit := p.MaxResults
-		if limit <= 0 {
-			limit = defaultFindPageSize
-		}
-		fingerprint := cursorFingerprint(root, p.Pattern, strconv.Itoa(limit))
-		page, err := parseSearchCursor(p.Cursor, "f", fingerprint)
+		result, err := engine.Find(ctx, root, fff.FindOptions{Pattern: query, Limit: limit, Page: page, UseQueryParser: true})
 		if err != nil {
 			return tool.ToolResult[FindDetails]{}, err
 		}
-		result, err := engine.Find(ctx, root, fff.FindOptions{Pattern: p.Pattern, Limit: limit, Page: page})
-		if err != nil {
-			return tool.ToolResult[FindDetails]{}, err
+		output, weak, shown := formatFFFFind(result, limit, pattern)
+		shownSoFar := page*limit + len(result.Files)
+		hasMore := len(result.Files) >= limit && result.TotalMatched > shownSoFar
+		details := FindDetails{
+			Results: shown, TotalMatched: result.TotalMatched, TotalFiles: result.TotalFiles,
+			PageIndex: page, HasMore: hasMore,
 		}
-		found := make([]string, 0, len(result.Files))
-		for _, file := range result.Files {
-			found = append(found, file.Path)
+		notices := make([]string, 0, 1)
+		if weak && shown > 0 {
+			notices = append(notices, fmt.Sprintf("Query %q produced only weak scattered fuzzy matches. Output capped at %d/%d.", pattern, shown, result.TotalMatched))
 		}
-		details := FindDetails{Results: len(found)}
-		if result.NextPage > 0 {
-			details.Cursor = searchCursor("f", result.NextPage, fingerprint)
-			found = append(found, fmt.Sprintf("Continue with cursor=\"%s\"", details.Cursor))
+		if !weak && hasMore {
+			details.Cursor = cursors.put(findCursor{Root: root, Query: query, Pattern: pattern, PageSize: limit, NextPage: page + 1})
+			remaining := result.TotalMatched - shownSoFar
+			word := "matches"
+			if remaining == 1 {
+				word = "match"
+			}
+			notices = append(notices, fmt.Sprintf("%d more %s available. cursor=\"%s\" to continue", remaining, word, details.Cursor))
 		}
-		text, tr := truncate(ctx, c, "find-output", []byte(strings.Join(found, "\n")))
+		text, tr := truncateFFFOutput(ctx, c, "find-output", output, notices)
 		details.Truncation = tr
 		return tool.ToolResult[FindDetails]{Content: []message.Content{message.Text(text)}, Details: details}, nil
 	}}

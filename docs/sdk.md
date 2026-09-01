@@ -447,7 +447,7 @@ err := h.RegisterBuiltinTools(harness.BuiltinConfig{
 defer h.Close()
 ```
 
-`grep` 和 `find` 使用索引搜索，支持 Windows x86-64、Linux x86-64/ARM64 和 macOS Apple Silicon。SDK 通过 purego 加载预编译的 FFF C FFI，不依赖 cgo 或本机 C 编译器。`find` 可以使用 glob（如 `*.go`）或模糊路径查询；`grep` 支持正则、`literal` 和上下文行。结果较多时，使用返回的 `cursor` 继续读取下一页。
+`grep` 和 `find` 复用 Pi FFF extension 的工具语义，支持 Windows x86-64、Linux x86-64/ARM64 和 macOS Apple Silicon。SDK 通过 purego 加载预编译的 FFF C FFI，不依赖 cgo 或本机 C 编译器。`find` 支持模糊路径查询，并通过 `path`/`exclude` 使用 FFF 查询约束；`grep` 默认 smart-case，自动识别合法正则与普通文本，并支持 `path`、`exclude` 和上下文行。结果较多时使用返回的 opaque `cursor` 继续；`grep.limit` 是在文件边界生效的软上限，因此一页可能略多于指定条数。
 
 不再使用 Harness 时调用 `Close`。离线打包时，可通过 `FFFLibraryPath` 或 `BEST_HARNESS_FFF_LIBRARY` 指向随应用分发的库文件。
 
@@ -808,6 +808,29 @@ if err := h.RegisterExtension(auditExtension{}); err != nil {
 ```
 
 常用 Hook 包括输入处理、请求发送前、响应完成后、工具调用前后、会话开始和会话关闭。Extension 的状态类型必须与 `Harness[S]` 一致。
+
+当扩展需要把 tracing span、baggage 或其他 request-scoped value 继续传给 Provider 或工具实现时，使用 context-enricher Hook。返回的 context 会传给后续普通 Hook 和实际执行体：
+
+```go
+r.AddRequestContextHook(func(
+	ctx context.Context,
+	c harness.Context[AgentState],
+	_ *harness.Request,
+) (context.Context, error) {
+	return context.WithValue(ctx, requestSessionKey{}, c.SessionID()), nil
+})
+
+r.AddToolContextHook(func(
+	ctx context.Context,
+	c harness.Context[AgentState],
+	call harness.ToolCall,
+) (context.Context, error) {
+	value := c.SessionID() + ":" + call.ID
+	return context.WithValue(ctx, toolCallKey{}, value), nil
+})
+```
+
+`AddRequestContextHook` 在普通 `AddRequestHook` 前运行；`AddToolContextHook` 在参数解码、校验及 `AddBeforeToolCallHook` 后运行。context Hook 不得返回 nil context。
 
 优先使用普通工具和 `Session` API。只有需要跨会话复用同一段生命周期逻辑时再使用 Extension。
 
