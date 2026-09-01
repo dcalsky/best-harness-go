@@ -7,10 +7,16 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
 )
+
+var windowsBridgeRegistry = struct {
+	sync.Mutex
+	bridges map[string]*windowsBridge
+}{bridges: make(map[string]*windowsBridge)}
 
 type windowsBridge struct {
 	dll *syscall.DLL
@@ -64,18 +70,12 @@ func nativeOpen(ctx context.Context, root string, opts Options) (*nativeFinder, 
 	if err != nil {
 		return nil, err
 	}
-	dll, err := syscall.LoadDLL(libraryPath)
+	bridge, err := windowsBridgeFor(libraryPath)
 	if err != nil {
-		return nil, fmt.Errorf("load FFF %s C library %s: %w", ReleaseVersion, libraryPath, err)
-	}
-	bridge, err := loadWindowsBridge(dll)
-	if err != nil {
-		_ = dll.Release()
 		return nil, err
 	}
 	rootBytes, err := syscall.ByteSliceFromString(root)
 	if err != nil {
-		_ = dll.Release()
 		return nil, fmt.Errorf("invalid FFF root: %w", err)
 	}
 	createOpts := windowsCreateOptions{
@@ -87,28 +87,48 @@ func nativeOpen(ctx context.Context, root string, opts Options) (*nativeFinder, 
 		AIMode:                1,
 	}
 	if unsafe.Sizeof(createOpts) != 88 {
-		_ = dll.Release()
 		return nil, fmt.Errorf("unexpected FFF create-options layout: %d bytes", unsafe.Sizeof(createOpts))
 	}
 	result, _, _ := bridge.create.Call(uintptr(unsafe.Pointer(&createOpts)))
 	runtime.KeepAlive(rootBytes)
 	if result == 0 {
-		_ = dll.Release()
 		return nil, fmt.Errorf("FFF returned no create result")
 	}
 	if !bridge.success(result) {
 		message := bridge.errorMessage(result)
 		bridge.freeResult.Call(result)
-		_ = dll.Release()
 		return nil, fmt.Errorf("%s", message)
 	}
 	handle, _, _ := bridge.resultHandle.Call(result)
 	bridge.freeResult.Call(result)
 	if handle == 0 {
-		_ = dll.Release()
 		return nil, fmt.Errorf("FFF returned an empty instance handle")
 	}
 	return &nativeFinder{bridge: bridge, handle: handle}, nil
+}
+
+// windowsBridgeFor keeps an FFF DLL loaded for the lifetime of the process.
+// FFF destroys each instance synchronously, but worker threads can still return
+// through DLL code briefly afterwards. FreeLibrary would unmap that code and
+// can cause a delayed access violation. Reusing one bridge per path also avoids
+// accumulating a LoadLibrary reference for every indexed root.
+func windowsBridgeFor(libraryPath string) (*windowsBridge, error) {
+	windowsBridgeRegistry.Lock()
+	defer windowsBridgeRegistry.Unlock()
+	if bridge := windowsBridgeRegistry.bridges[libraryPath]; bridge != nil {
+		return bridge, nil
+	}
+	dll, err := syscall.LoadDLL(libraryPath)
+	if err != nil {
+		return nil, fmt.Errorf("load FFF %s C library %s: %w", ReleaseVersion, libraryPath, err)
+	}
+	bridge, err := loadWindowsBridge(dll)
+	if err != nil {
+		_ = dll.Release()
+		return nil, err
+	}
+	windowsBridgeRegistry.bridges[libraryPath] = bridge
+	return bridge, nil
 }
 
 func loadWindowsBridge(dll *syscall.DLL) (*windowsBridge, error) {
@@ -185,7 +205,6 @@ func (n *nativeFinder) close() {
 		n.bridge.destroy.Call(n.handle)
 		n.handle = 0
 	}
-	_ = n.bridge.dll.Release()
 	n.bridge = nil
 }
 
