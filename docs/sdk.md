@@ -444,22 +444,14 @@ err := h.RegisterBuiltinTools(harness.BuiltinConfig{
 	Cwd:        projectDir,
 	FileSystem: harness.OSFileSystem{},
 })
-defer h.Close() // 关闭 FFF 索引、缓存和文件 watcher
+defer h.Close()
 ```
 
-`grep` 和 `find` 使用 [FFF v0.10.6](https://github.com/dmtrKovalenko/fff/releases/tag/v0.10.6) 的常驻索引。首次使用时，SDK 会下载匹配平台的预编译 C FFI，核对发布方 SHA-256，再原子写入用户缓存目录。支持：
+`grep` 和 `find` 使用索引搜索，支持 Windows x86-64、Linux x86-64/ARM64 和 macOS Apple Silicon。`find` 可以使用 glob（如 `*.go`）或模糊路径查询；`grep` 支持正则、`literal` 和上下文行。结果较多时，使用返回的 `cursor` 继续读取下一页。
 
-- Windows x86-64（`windows/amd64`）；
-- Linux x86-64 和 ARM64（`linux/amd64`、`linux/arm64`），自动选择 GNU libc 或 musl；
-- macOS Apple Silicon（`darwin/arm64`）。
+不再使用 Harness 时调用 `Close`。离线打包时，可通过 `FFFLibraryPath` 或 `BEST_HARNESS_FFF_LIBRARY` 指向随应用分发的库文件。
 
-macOS 和 Linux 构建需要启用 cgo；Windows/amd64 使用系统 DLL loader，不需要 cgo。离线部署可以把发布资产随应用分发，并通过 `FFFLibraryPath` 或 `BEST_HARNESS_FFF_LIBRARY` 指向绝对路径。通过 `FFFCacheDir` 或 `BEST_HARNESS_FFF_CACHE_DIR` 可以修改自动下载缓存目录。
-
-每个 Pool 默认最多保留四个索引根目录；超过后按 LRU 关闭旧索引和 watcher，可通过 `FFFMaxRoots` 调整。`Harness.Close` 会释放 Harness 注册的所有 FFF 资源。直接向 `ToolRegistry` 注册时，可使用 `RegisterBuiltinToolsManaged` 取得需要关闭的 `FFFPool`。
-
-`find` 的 glob（如 `*.go`）走 FFF glob 搜索，普通文本走模糊路径搜索；结果支持 `cursor` 继续下一页。`grep` 支持正则、`literal`、上下文行和 cursor，单页目标上限最多 50 条，但会按 FFF 语义完成当前文件后再分页。每次 grep 的原生搜索预算最多为 10 秒，并进一步受调用 context deadline 限制。FFF 若无法编译正则并回退到字面量匹配，结果文本和 `GrepDetails.RegexFallbackError` 都会明确报告。
-
-FFF 直接索引宿主文件系统，所以默认的 `find` 和 `grep` 只接受 `OSFileSystem`。应用使用自定义 `FileSystem` 做隔离时，不能让 FFF 绕过它；应改用显式的自定义 `Search` 后端，或只把已授权的目录设为 `Cwd`。
+默认搜索直接访问宿主文件系统，因此使用自定义 `FileSystem` 时，请同时提供自定义 `Search` 后端。
 
 这会让模型访问 `FileSystem`，并通过 `Shell` 执行命令。没有传入 `Shell` 时使用本机 Shell。不要把超出任务范围的目录或执行器传给不受信任的请求。
 
