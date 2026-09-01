@@ -168,6 +168,7 @@ type Prompt struct{ Steps prompt.Sequence }
 type PrepareNextTurn func(context.Context, []message.Message) ([]message.Message, error)
 type ShouldStopAfterTurn func(context.Context, []message.Message) (bool, error)
 type BeforeToolCall func(context.Context, tool.ToolCall) (tool.ToolCall, error)
+type ToolContext func(context.Context, tool.ToolCall) (context.Context, error)
 type AfterToolCall func(context.Context, tool.ToolCall, tool.Result) (tool.Result, error)
 
 type Options struct {
@@ -184,6 +185,7 @@ type Options struct {
 	ShouldStopAfterTurn ShouldStopAfterTurn
 	ToolBatches         invocation.ToolBatchCoordinator
 	BeforeTool          BeforeToolCall
+	ToolContext         ToolContext
 	AfterTool           AfterToolCall
 }
 type Agent struct {
@@ -1054,7 +1056,7 @@ func (a *Agent) executeCalls(r *Run, ctx context.Context, calls []tool.ToolCall)
 		a.emit(Event{Type: EventToolEnd, Call: &call, Result: &res, Err: displayErr})
 		results[i] = message.Message{Role: message.RoleTool, Origin: message.OriginTool, Content: res.Content, ToolCallID: call.ID, ToolCallKey: call.Key, ToolName: call.Name, IsError: true, Timestamp: time.Now().UnixMilli()}
 	}
-	run := func(i int, prepared *tool.Prepared, call tool.ToolCall) {
+	run := func(i int, prepared *tool.Prepared, call tool.ToolCall, baseCtx context.Context) {
 		finished := false
 		defer func() {
 			if recovered := recover(); recovered != nil && !finished {
@@ -1067,7 +1069,7 @@ func (a *Agent) executeCalls(r *Run, ctx context.Context, calls []tool.ToolCall)
 			}
 			wg.Done()
 		}()
-		execCtx := ctx
+		execCtx := baseCtx
 		report := func(v any) error {
 			a.emit(Event{Type: EventToolUpdate, Call: &call, Update: v})
 			return nil
@@ -1075,16 +1077,16 @@ func (a *Agent) executeCalls(r *Run, ctx context.Context, calls []tool.ToolCall)
 		var sequentialBatch invocation.ToolBatch
 		if a.opts.ToolBatches != nil {
 			if mode == tool.Parallel {
-				execCtx = parallelBatch.Context(i, ctx, call, report)
+				execCtx = parallelBatch.Context(i, baseCtx, call, report)
 			} else {
-				sequentialBatch, commitErr = a.opts.ToolBatches.BeginToolBatch(ctx, []tool.ToolCall{call}, false)
+				sequentialBatch, commitErr = a.opts.ToolBatches.BeginToolBatch(baseCtx, []tool.ToolCall{call}, false)
 				if commitErr != nil {
 					err := commitErr
 					errs[i] = err
 					results[i] = message.Message{Role: message.RoleTool, Origin: message.OriginTool, Content: []message.Content{message.Text(err.Error())}, ToolCallID: call.ID, ToolCallKey: call.Key, ToolName: call.Name, IsError: true, Timestamp: time.Now().UnixMilli()}
 					return
 				}
-				execCtx = sequentialBatch.Context(0, ctx, call, report)
+				execCtx = sequentialBatch.Context(0, baseCtx, call, report)
 			}
 		}
 		res, err := prepared.Execute(execCtx, func(v any) { _ = report(v) })
@@ -1124,6 +1126,7 @@ func (a *Agent) executeCalls(r *Run, ctx context.Context, calls []tool.ToolCall)
 	}
 	preparedCalls := make([]*tool.Prepared, len(calls))
 	preparedValues := make([]tool.ToolCall, len(calls))
+	preparedContexts := make([]context.Context, len(calls))
 	for i, original := range calls {
 		call := original
 		a.emit(Event{Type: EventToolStart, Call: &call})
@@ -1158,10 +1161,29 @@ func (a *Agent) executeCalls(r *Run, ctx context.Context, calls []tool.ToolCall)
 				call = prepared.Call()
 			}
 		}
+		toolCtx := ctx
+		if a.opts.ToolContext != nil {
+			toolCtx, err = a.opts.ToolContext(ctx, call)
+			if err != nil {
+				res := tool.Result{Content: []message.Content{message.Text(err.Error())}, IsError: true}
+				errs[i] = err
+				a.emit(Event{Type: EventToolEnd, Call: &call, Result: &res, Err: err})
+				results[i] = message.Message{Role: message.RoleTool, Origin: message.OriginTool, Content: res.Content, ToolCallID: call.ID, ToolCallKey: call.Key, ToolName: call.Name, IsError: true, Timestamp: time.Now().UnixMilli()}
+				continue
+			}
+			if toolCtx == nil {
+				err = errors.New("tool context hook returned a nil context")
+				res := tool.Result{Content: []message.Content{message.Text(err.Error())}, IsError: true}
+				errs[i] = err
+				a.emit(Event{Type: EventToolEnd, Call: &call, Result: &res, Err: err})
+				results[i] = message.Message{Role: message.RoleTool, Origin: message.OriginTool, Content: res.Content, ToolCallID: call.ID, ToolCallKey: call.Key, ToolName: call.Name, IsError: true, Timestamp: time.Now().UnixMilli()}
+				continue
+			}
+		}
 		_, _ = r.observeValidatorResult(call.Name, nil)
 		if mode == tool.Sequential {
 			wg.Add(1)
-			run(i, prepared, call)
+			run(i, prepared, call, toolCtx)
 			if commitErr != nil {
 				for j := i + 1; j < len(calls); j++ {
 					recordCanceled(j, calls[j], commitErr)
@@ -1171,6 +1193,7 @@ func (a *Agent) executeCalls(r *Run, ctx context.Context, calls []tool.ToolCall)
 		} else {
 			preparedCalls[i] = prepared
 			preparedValues[i] = call
+			preparedContexts[i] = toolCtx
 		}
 	}
 	if mode == tool.Parallel {
@@ -1192,7 +1215,7 @@ func (a *Agent) executeCalls(r *Run, ctx context.Context, calls []tool.ToolCall)
 				continue
 			}
 			wg.Add(1)
-			go run(i, prepared, preparedValues[i])
+			go run(i, prepared, preparedValues[i], preparedContexts[i])
 		}
 	}
 	wg.Wait()

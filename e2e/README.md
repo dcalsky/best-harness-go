@@ -44,3 +44,20 @@ pi checkout must have its npm dependencies installed so that `tsx` is present.
 ```text
 BEST_HARNESS_PI_PARITY_E2E=1 go test -v ./e2e/... -run TestPiSDKProviderContextParity -count=1
 ```
+
+## FFF native search
+
+The `TestFFFExampleRepo*` suite indexes `testdata/example-repo` with the real
+FFF C library through purego. It checks constrained and fuzzy find, plain and regex
+grep, native file-boundary cursor pagination, context line numbering, smart-case, and live
+watcher updates against filesystem-derived expectations.
+
+Use the pinned release asset for the current platform:
+
+```text
+cd e2e
+CGO_ENABLED=0 BEST_HARNESS_FFF_INTEGRATION=1 go test -v -count=1 -run '^TestFFFExampleRepo' .
+```
+
+For offline runs, set `BEST_HARNESS_FFF_LIBRARY` to a compatible FFF v0.10.6
+shared library instead.

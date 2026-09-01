@@ -48,7 +48,6 @@ type otelExt struct {
 type runSpans struct {
 	root       trace.Span
 	llm        trace.Span // in-flight llm.request span, if any
-	tool       trace.Span // in-flight tool.execute span, if any
 	llmStart   time.Time
 	ttftMarked bool
 }
@@ -69,7 +68,8 @@ func (e *otelExt) run(runID string) *runSpans {
 }
 
 // parent returns ctx carrying the run root span, so llm/tool spans nest under
-// harness.run. Hooks can't return a modified ctx, so parenting is explicit.
+// harness.run. The context-enricher hooks then propagate those child spans to
+// the provider and tool body.
 func (e *otelExt) parent(ctx context.Context, runID string) context.Context {
 	if root := e.run(runID).root; root != nil {
 		return trace.ContextWithSpan(ctx, root)
@@ -99,9 +99,9 @@ func (e *otelExt) Register(r *harness.ExtensionRegistry[harness.NoState]) error 
 
 	// llm.request opens right before the provider stream starts; it sees the
 	// final request (after Context hooks).
-	r.AddRequestHook(func(ctx context.Context, c harness.Context[harness.NoState], req *harness.Request) error {
+	r.AddRequestContextHook(func(ctx context.Context, c harness.Context[harness.NoState], req *harness.Request) (context.Context, error) {
 		rs := e.run(string(c.RunID()))
-		_, span := e.tracer.Start(e.parent(ctx, string(c.RunID())), "llm.request", trace.WithAttributes(
+		spanCtx, span := e.tracer.Start(e.parent(ctx, string(c.RunID())), "llm.request", trace.WithAttributes(
 			attribute.String("gen_ai.system", req.Model.Provider),
 			attribute.String("gen_ai.request.model", req.Model.ID),
 			attribute.Int("llm.messages_count", len(req.Messages)),
@@ -110,7 +110,7 @@ func (e *otelExt) Register(r *harness.ExtensionRegistry[harness.NoState]) error 
 		rs.llm = span
 		rs.llmStart = time.Now()
 		rs.ttftMarked = false
-		return nil
+		return spanCtx, nil
 	})
 
 	// Fires on success AND failure: error messages carry StopReason/ErrorMessage.
@@ -150,24 +150,16 @@ func (e *otelExt) Register(r *harness.ExtensionRegistry[harness.NoState]) error 
 		return nil
 	})
 
-	r.AddBeforeToolCallHook(func(ctx context.Context, c harness.Context[harness.NoState], call harness.ToolCall) (harness.ToolCall, error) {
-		_, span := e.tracer.Start(e.parent(ctx, string(c.RunID())), "tool.execute", trace.WithAttributes(
+	r.AddToolContextHook(func(ctx context.Context, c harness.Context[harness.NoState], call harness.ToolCall) (context.Context, error) {
+		spanCtx, _ := e.tracer.Start(e.parent(ctx, string(c.RunID())), "tool.execute", trace.WithAttributes(
 			attribute.String("tool.name", call.Name),
 			attribute.String("tool.arguments", truncate(string(call.Arguments))),
 		))
-		// ponytail: one in-flight tool span per run; parallel tools share the map
-		// slot keyed by call ID if you ever enable ExecutionMode parallel.
-		e.run(string(c.RunID())).tool = span
-		return call, nil
+		return spanCtx, nil
 	})
 
-	r.AddAfterToolCallHook(func(ctx context.Context, c harness.Context[harness.NoState], call harness.ToolCall, res harness.Result) (harness.Result, error) {
-		rs := e.run(string(c.RunID()))
-		span := rs.tool
-		if span == nil {
-			return res, nil
-		}
-		rs.tool = nil
+	r.AddAfterToolCallHook(func(ctx context.Context, _ harness.Context[harness.NoState], call harness.ToolCall, res harness.Result) (harness.Result, error) {
+		span := trace.SpanFromContext(ctx)
 		span.SetAttributes(attribute.Bool("tool.is_error", res.IsError))
 		var err error
 		if res.IsError {

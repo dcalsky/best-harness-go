@@ -1,6 +1,7 @@
 name: test
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -9,8 +10,36 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - run: go test ./...
+
+  fff-native:
+    name: fff-native (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            os: ubuntu-latest
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+          - target: darwin-arm64
+            os: macos-14
+          - target: windows-amd64
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      BEST_HARNESS_FFF_INTEGRATION: "1"
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: go test -v -count=1 ./internal/fff ./internal/builtin
+      - name: Test FFF against example repository
+        working-directory: e2e
+        run: go test -v -count=1 -run '^TestFFFExampleRepo' .

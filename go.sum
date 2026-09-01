@@ -42,6 +42,8 @@ github.com/dcalsky/novocab-go v0.2.0 h1:MAmcXCp7O9huYG68yIb/AzgT/nUKV93G+19Q2wL3
 github.com/dcalsky/novocab-go v0.2.0/go.mod h1:o+0fqY6hVWU2b1qEVHdAdeE4Rm1cOrokcOEC3ROi6NM=
 github.com/dnaeon/go-vcr v1.2.0 h1:zHCHvJYTMh1N7xnV7zf1m1GPBF9Ad0Jk/whtQ1663qI=
 github.com/dnaeon/go-vcr v1.2.0/go.mod h1:R4UdLID7HZT3taECzJs4YgbbH6PIGXB6W/sc5OLb6RQ=
+github.com/ebitengine/purego v0.11.0-alpha.11 h1:M0Rv0h9UejkDKQnlPF8/OzcMkpnlrTreUxtX+zOMqDE=
+github.com/ebitengine/purego v0.11.0-alpha.11/go.mod h1:DCHPP08djqhNSoTfImcnHYQRZmd0qhakvrozqaEYhGQ=
 github.com/invopop/jsonschema v0.14.0 h1:MHQqLhvpNUZfw+hM3AZDYK7jxO8FZoQeQM77g8iyZjg=
 github.com/invopop/jsonschema v0.14.0/go.mod h1:ygm6C2EaVNMBDPpaPlnOA2pFAxBnxGjFlMZABxm9n2I=
 github.com/openai/openai-go/v3 v3.53.0 h1:7aqFj5C0qHJYciNncfiEcYDMIEpbzObbC4mrmcA+QOA=
