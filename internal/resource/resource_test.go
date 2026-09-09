@@ -87,7 +87,6 @@ func TestDefaultSystemPromptMatchesPiCoreStructure(t *testing.T) {
 		"You are an expert coding assistant operating inside pi, a coding agent harness.",
 		"- Be concise in your responses",
 		"- Show file paths clearly when working with files",
-		"Current working directory: /work/project",
 	} {
 		if !strings.Contains(prompt, text) {
 			t.Fatalf("prompt missing %q:\n%s", text, prompt)
@@ -95,5 +94,8 @@ func TestDefaultSystemPromptMatchesPiCoreStructure(t *testing.T) {
 	}
 	if strings.Contains(prompt, "Available tools:") || strings.Contains(prompt, "Use read to examine files") {
 		t.Fatalf("tool prompt content should not be injected:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "/work/project") || strings.Contains(strings.ToLower(prompt), "working directory") {
+		t.Fatalf("working directory should not be injected:\n%s", prompt)
 	}
 }

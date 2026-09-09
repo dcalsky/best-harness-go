@@ -855,11 +855,16 @@ func (s *Session[S]) ensureAgent(ctx context.Context) error {
 	for _, definition := range definitions {
 		effectiveTools = append(effectiveTools, definition.Name)
 	}
-	promptSnapshot := s.snapshot
+	var system string
 	if s.opts.SystemPrompt != "" {
-		promptSnapshot.SystemPrompt = s.opts.SystemPrompt
+		// An explicit system prompt is caller-owned. Forward it verbatim instead
+		// of merging resource text or session metadata into it.
+		system = s.opts.SystemPrompt
+	} else {
+		// Cwd is execution metadata for tools and resource loading. It must not be
+		// exposed to the model, including when the default prompt is used.
+		system = resource.BuildSystemPrompt(resource.PromptOptions{Tools: effectiveTools, Snapshot: s.snapshot})
 	}
-	system := resource.BuildSystemPrompt(resource.PromptOptions{Cwd: s.store.Header().Cwd, Tools: effectiveTools, Snapshot: promptSnapshot})
 	wrapped := hookedProvider[S]{session: s, base: p, hooks: s.harness.extensions.Request, requestContextHooks: s.harness.extensions.RequestCtx, contextHooks: s.harness.extensions.Context}
 	reasoning := s.store.Context().ThinkingLevel
 	if reasoning == "off" {
