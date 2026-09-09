@@ -159,16 +159,23 @@ func TestSessionGenerationConfigIsClonedPerRequest(t *testing.T) {
 func TestSessionSystemPromptReplacesDefault(t *testing.T) {
 	p := &captureProvider{}
 	models := harness.NewModelRegistry()
+	resources := harness.NewResourceRegistry()
+	resources.Register(harness.ProgramResourceLoader{Snapshot: harness.ResourceSnapshot{
+		SystemPrompt:       "resource-defined prompt",
+		AppendSystemPrompt: []harness.ResourceSource{{Content: "resource tail"}},
+		ProjectInstructions: []harness.ResourceSource{{Path: "AGENTS.md", Content: "resource instructions"}},
+	}})
 	selected := harness.Model{Provider: "test", ID: "m"}
 	_ = models.Register(selected)
-	h, err := harness.NewStateless(harness.Options{Models: models})
+	h, err := harness.NewStateless(harness.Options{Models: models, Resources: resources})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err = h.RegisterProvider("test", p); err != nil {
 		t.Fatal(err)
 	}
-	s, err := h.NewSession(context.Background(), harness.NewMemoryPersistence(), harness.SessionOptions{Model: &selected, SystemPrompt: "developer-defined prompt"}, harness.NoState{})
+	const explicitPrompt = "  developer-defined prompt\n"
+	s, err := h.NewSession(context.Background(), harness.NewMemoryPersistence(), harness.SessionOptions{Model: &selected, SystemPrompt: explicitPrompt}, harness.NoState{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +186,7 @@ func TestSessionSystemPromptReplacesDefault(t *testing.T) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(p.requests) != 1 || !strings.HasPrefix(p.requests[0].SystemPrompt, "developer-defined prompt\n") || strings.Contains(p.requests[0].SystemPrompt, "operating inside pi") {
+	if len(p.requests) != 1 || p.requests[0].SystemPrompt != explicitPrompt {
 		t.Fatalf("system prompt=%q", p.requests[0].SystemPrompt)
 	}
 }

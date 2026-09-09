@@ -140,9 +140,6 @@ func BuildSystemPrompt(o PromptOptions) string {
 		}
 		b.WriteString("\n</available_skills>")
 	}
-	if o.Cwd != "" {
-		fmt.Fprintf(&b, "\nCurrent working directory: %s", strings.ReplaceAll(o.Cwd, "\\", "/"))
-	}
 	return strings.TrimSpace(b.String())
 }
 

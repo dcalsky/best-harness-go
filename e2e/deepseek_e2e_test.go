@@ -294,7 +294,7 @@ func TestDeepSeekHarnessSessionResourceExtensionAndSettings(t *testing.T) {
 	assertContextRoles(t, requests[0], harness.RoleUser)
 	if strings.Contains(requests[0].SystemPrompt, "Available tools:") ||
 		!strings.Contains(requests[0].SystemPrompt, `<project_instructions path="`+filepath.Join(project, "AGENTS.md")+`">`) ||
-		!strings.HasSuffix(requests[0].SystemPrompt, "Current working directory: "+project) {
+		strings.Contains(requests[0].SystemPrompt, "Current working directory:") {
 		t.Fatalf("pi-incompatible system prompt=%q", requests[0].SystemPrompt)
 	}
 	customID, err := s.AppendCustom(ctx, "e2e", struct {
