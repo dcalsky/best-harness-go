@@ -58,6 +58,7 @@ type puregoBridge struct {
 	resultSuccess func(uintptr) bool
 	resultError   func(uintptr) string
 	resultHandle  func(uintptr) uintptr
+	resultInt     func(uintptr) int64
 
 	searchItem  func(uintptr, uint32) uintptr
 	searchScore func(uintptr, uint32) unsafe.Pointer
@@ -171,6 +172,7 @@ func puregoBridgeFor(libraryPath string) (*puregoBridge, error) {
 		{"fff_result_get_success", &bridge.resultSuccess},
 		{"fff_result_get_error", &bridge.resultError},
 		{"fff_result_get_handle", &bridge.resultHandle},
+		{"fff_result_get_int_value", &bridge.resultInt},
 		{"fff_search_result_get_item", &bridge.searchItem},
 		{"fff_search_result_get_score", &bridge.searchScore},
 		{"fff_search_result_get_count", &bridge.searchCount},
@@ -242,7 +244,18 @@ func (n *nativeFinder) close() {
 }
 
 func (n *nativeFinder) waitForScan(timeout time.Duration) error {
-	return n.consumeEnvelope(n.bridge.waitForScan(n.handle, uint64(timeout.Milliseconds())))
+	result := n.bridge.waitForScan(n.handle, uint64(timeout.Milliseconds()))
+	if result == 0 {
+		return fmt.Errorf("FFF returned no result")
+	}
+	defer n.bridge.freeResult(result)
+	if !n.bridge.resultSuccess(result) {
+		return fmt.Errorf("%s", n.bridge.errorMessage(result))
+	}
+	if n.bridge.resultInt(result) == 0 {
+		return fmt.Errorf("FFF initial scan timed out after %s: %w", timeout, context.DeadlineExceeded)
+	}
+	return nil
 }
 
 func (n *nativeFinder) search(query string, page, limit int) (FindResult, error) {
@@ -309,7 +322,7 @@ func (n *nativeFinder) grep(opts GrepOptions) (GrepResult, error) {
 		opts.SmartCase,
 		uint32(opts.FileOffset),
 		uint32(opts.Limit),
-		uint64(opts.TimeBudget.Milliseconds()),
+		grepBudgetMilliseconds(opts.TimeBudget),
 		uint32(opts.BeforeContext),
 		uint32(opts.AfterContext),
 		true,
@@ -363,15 +376,13 @@ func (n *nativeFinder) grep(opts GrepOptions) (GrepResult, error) {
 	}, nil
 }
 
-func (n *nativeFinder) consumeEnvelope(result uintptr) error {
-	if result == 0 {
-		return fmt.Errorf("FFF returned no result")
+// FFF interprets zero as unlimited. Preserve that only for an explicit zero
+// duration; a positive sub-millisecond budget must remain bounded.
+func grepBudgetMilliseconds(budget time.Duration) uint64 {
+	if budget > 0 && budget < time.Millisecond {
+		return 1
 	}
-	defer n.bridge.freeResult(result)
-	if !n.bridge.resultSuccess(result) {
-		return fmt.Errorf("%s", n.bridge.errorMessage(result))
-	}
-	return nil
+	return uint64(budget.Milliseconds())
 }
 
 func (n *nativeFinder) payload(result uintptr) (uintptr, error) {

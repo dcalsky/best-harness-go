@@ -70,13 +70,15 @@ const (
 
 // GrepOptions configures a content search.
 type GrepOptions struct {
-	Pattern       string
-	Constraints   string
-	Mode          GrepMode
-	SmartCase     bool
-	Limit         int
-	FileOffset    int
-	MaxFileSize   uint64
+	Pattern     string
+	Constraints string
+	Mode        GrepMode
+	SmartCase   bool
+	Limit       int
+	FileOffset  int
+	MaxFileSize uint64
+	// TimeBudget bounds native grep work; zero is unlimited unless ctx has a deadline.
+	// Cancellation is checked before and after the synchronous native call.
 	TimeBudget    time.Duration
 	MaxPerFile    int
 	BeforeContext int
@@ -307,6 +309,9 @@ func (f *Finder) ensure(ctx context.Context) (*nativeFinder, error) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if f.native != nil {
 		return f.native, nil
 	}
@@ -326,6 +331,9 @@ func (f *Finder) ensure(ctx context.Context) (*nativeFinder, error) {
 	}
 	if err := n.waitForScan(scanTimeout); err != nil {
 		n.close()
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, contextErr
+		}
 		return nil, fmt.Errorf("initialize FFF index for %s: %w", f.root, err)
 	}
 	if err := ctx.Err(); err != nil {
@@ -388,6 +396,17 @@ func (f *Finder) grep(ctx context.Context, opts GrepOptions) (GrepResult, error)
 	}
 	if err := ctx.Err(); err != nil {
 		return GrepResult{}, err
+	}
+	// Initialization may have spent time downloading the library or scanning.
+	// Recompute the remaining budget immediately before entering native code.
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return GrepResult{}, context.DeadlineExceeded
+		}
+		if opts.TimeBudget == 0 || remaining < opts.TimeBudget {
+			opts.TimeBudget = remaining
+		}
 	}
 	result, err := n.grep(opts)
 	if err == nil {
