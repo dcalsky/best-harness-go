@@ -85,6 +85,43 @@ func TestWaitForScanResultContract(t *testing.T) {
 	}
 }
 
+// v0.10.6 marks the filesystem scan complete before post-scan content
+// indexing finishes. Cursor pagination must not begin until both are stable.
+func TestWaitForIndexingWaitsForPostScanWatcher(t *testing.T) {
+	watcherCalls := 0
+	n := &nativeFinder{handle: 1, bridge: &puregoBridge{
+		waitForScan:   func(uintptr, uint64) uintptr { return 1 },
+		waitForWatch:  func(uintptr, uint64) uintptr { watcherCalls++; return 2 },
+		resultSuccess: func(uintptr) bool { return true },
+		resultInt:     func(uintptr) int64 { return 1 },
+		freeResult:    func(uintptr) {},
+	}}
+	if err := n.waitForIndexing(time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if watcherCalls != 1 {
+		t.Fatalf("watcher waits=%d", watcherCalls)
+	}
+}
+
+func TestWaitForIndexingReportsWatcherTimeout(t *testing.T) {
+	n := &nativeFinder{handle: 1, bridge: &puregoBridge{
+		waitForScan:   func(uintptr, uint64) uintptr { return 1 },
+		waitForWatch:  func(uintptr, uint64) uintptr { return 2 },
+		resultSuccess: func(uintptr) bool { return true },
+		resultInt: func(result uintptr) int64 {
+			if result == 2 {
+				return 0
+			}
+			return 1
+		},
+		freeResult: func(uintptr) {},
+	}}
+	if err := n.waitForIndexing(time.Second); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error=%v", err)
+	}
+}
+
 func TestGrepNativeBudget(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

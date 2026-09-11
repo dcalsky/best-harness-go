@@ -57,7 +57,7 @@ type Config struct {
 	// FFFLibraryPath is an optional absolute path to the FFF C library. When
 	// empty, the pinned prebuilt release is downloaded and verified.
 	FFFLibraryPath string
-	// FFFScanTimeout bounds the first-call wait for FFF's initial index scan.
+	// FFFScanTimeout bounds the first-call wait for FFF's initial index to stabilize.
 	FFFScanTimeout time.Duration
 	// FFFCacheDir overrides the cache used for the pinned prebuilt FFF library.
 	FFFCacheDir string
