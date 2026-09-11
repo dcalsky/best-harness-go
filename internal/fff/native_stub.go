@@ -18,6 +18,8 @@ func (*nativeFinder) close() {}
 
 func (*nativeFinder) waitForScan(time.Duration) error { return nil }
 
+func (*nativeFinder) waitForWatcher(time.Duration) error { return nil }
+
 func (*nativeFinder) search(string, int, int) (FindResult, error) {
 	return FindResult{}, fmt.Errorf("FFF is unavailable")
 }

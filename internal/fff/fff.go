@@ -25,6 +25,8 @@ var ErrClosed = errors.New("FFF search pool is closed")
 type Options struct {
 	LibraryPath string
 	CacheDir    string
+	// ScanTimeout bounds the first-call wait for the filesystem scan and
+	// post-scan indexing to become stable.
 	ScanTimeout time.Duration
 	MaxRoots    int
 
@@ -329,7 +331,7 @@ func (f *Finder) ensure(ctx context.Context) (*nativeFinder, error) {
 	if scanTimeout < time.Millisecond {
 		scanTimeout = time.Millisecond
 	}
-	if err := n.waitForScan(scanTimeout); err != nil {
+	if err := n.waitForIndexing(scanTimeout); err != nil {
 		n.close()
 		if contextErr := ctx.Err(); contextErr != nil {
 			return nil, contextErr
@@ -342,6 +344,26 @@ func (f *Finder) ensure(ctx context.Context) (*nativeFinder, error) {
 	}
 	f.native = n
 	return n, nil
+}
+
+// waitForIndexing waits for every phase that can change grep's candidate set.
+// FFF v0.10.6 installs its watcher only after post-scan content indexing and
+// binary classification finish, while wait-for-scan stops after the filesystem
+// walk. Starting cursor pagination between those points can make file offsets
+// refer to two different candidate sets.
+func (n *nativeFinder) waitForIndexing(timeout time.Duration) error {
+	started := time.Now()
+	if err := n.waitForScan(timeout); err != nil {
+		return err
+	}
+	remaining := timeout - time.Since(started)
+	if remaining <= 0 {
+		return fmt.Errorf("FFF content indexing timed out after %s: %w", timeout, context.DeadlineExceeded)
+	}
+	if err := n.waitForWatcher(remaining); err != nil {
+		return fmt.Errorf("finish FFF content indexing: %w", err)
+	}
+	return nil
 }
 
 func (f *Finder) close() {

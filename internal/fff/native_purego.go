@@ -44,12 +44,13 @@ type createOptions struct {
 type puregoBridge struct {
 	library uintptr
 
-	create      func(*createOptions) uintptr
-	destroy     func(uintptr)
-	waitForScan func(uintptr, uint64) uintptr
-	search      func(uintptr, string, uintptr, uint32, uint32, uint32, int32, uint32) uintptr
-	glob        func(uintptr, string, uintptr, uint32, uint32, uint32) uintptr
-	grep        func(uintptr, string, uint8, uint64, uint32, bool, uint32, uint32, uint64, uint32, uint32, bool) uintptr
+	create       func(*createOptions) uintptr
+	destroy      func(uintptr)
+	waitForScan  func(uintptr, uint64) uintptr
+	waitForWatch func(uintptr, uint64) uintptr
+	search       func(uintptr, string, uintptr, uint32, uint32, uint32, int32, uint32) uintptr
+	glob         func(uintptr, string, uintptr, uint32, uint32, uint32) uintptr
+	grep         func(uintptr, string, uint8, uint64, uint32, bool, uint32, uint32, uint64, uint32, uint32, bool) uintptr
 
 	freeResult func(uintptr)
 	freeSearch func(uintptr)
@@ -163,6 +164,7 @@ func puregoBridgeFor(libraryPath string) (*puregoBridge, error) {
 		{"fff_create_instance_with", &bridge.create},
 		{"fff_destroy", &bridge.destroy},
 		{"fff_wait_for_scan", &bridge.waitForScan},
+		{"fff_wait_for_watcher", &bridge.waitForWatch},
 		{"fff_search", &bridge.search},
 		{"fff_glob", &bridge.glob},
 		{"fff_live_grep", &bridge.grep},
@@ -244,7 +246,15 @@ func (n *nativeFinder) close() {
 }
 
 func (n *nativeFinder) waitForScan(timeout time.Duration) error {
-	result := n.bridge.waitForScan(n.handle, uint64(timeout.Milliseconds()))
+	return n.waitFor("initial scan", timeout, n.bridge.waitForScan)
+}
+
+func (n *nativeFinder) waitForWatcher(timeout time.Duration) error {
+	return n.waitFor("background watcher", timeout, n.bridge.waitForWatch)
+}
+
+func (n *nativeFinder) waitFor(phase string, timeout time.Duration, wait func(uintptr, uint64) uintptr) error {
+	result := wait(n.handle, uint64(timeout.Milliseconds()))
 	if result == 0 {
 		return fmt.Errorf("FFF returned no result")
 	}
@@ -253,7 +263,7 @@ func (n *nativeFinder) waitForScan(timeout time.Duration) error {
 		return fmt.Errorf("%s", n.bridge.errorMessage(result))
 	}
 	if n.bridge.resultInt(result) == 0 {
-		return fmt.Errorf("FFF initial scan timed out after %s: %w", timeout, context.DeadlineExceeded)
+		return fmt.Errorf("FFF %s timed out after %s: %w", phase, timeout, context.DeadlineExceeded)
 	}
 	return nil
 }
